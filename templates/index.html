@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="ru" class="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AI Job Hunter</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    html { scroll-behavior: smooth; }
+    ::-webkit-scrollbar { width: 8px; height: 8px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: #334155; border-radius: 8px; }
+    .letter-text { white-space: pre-wrap; }
+    .card-active { box-shadow: 0 0 0 2px rgba(99, 102, 241, 0.65); }
+    .fade-in { animation: fadeIn .25s ease; }
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+  </style>
+</head>
+<body class="bg-slate-950 text-slate-200 min-h-screen antialiased">
+
+  <!-- ======================= Header ======================= -->
+  <header class="sticky top-0 z-20 border-b border-slate-800 bg-slate-950/90 backdrop-blur">
+    <div class="mx-auto max-w-5xl px-4 py-3 flex flex-wrap items-center gap-3">
+      <div class="flex items-center gap-2.5">
+        <span id="ollama-dot" class="h-2.5 w-2.5 rounded-full bg-slate-600" title="Статус Ollama"></span>
+        <h1 class="text-lg font-semibold tracking-tight text-slate-50">AI Job Hunter</h1>
+        <span id="ollama-label" class="text-xs text-slate-500">проверка LLM…</span>
+      </div>
+      <div class="ml-auto flex items-center gap-3">
+        <span id="last-run" class="hidden text-xs text-slate-500"></span>
+        <button id="btn-run"
+          class="rounded-lg bg-indigo-600 hover:bg-indigo-500 active:bg-indigo-700 px-4 py-2 text-sm font-medium text-white transition-colors">
+          Запустить поиск
+        </button>
+      </div>
+    </div>
+
+    <!-- Прогресс прогона -->
+    <div id="progress-wrap" class="hidden mx-auto max-w-5xl px-4 pb-3">
+      <div class="flex justify-between text-xs text-slate-400 mb-1">
+        <span id="progress-phase">…</span>
+        <span id="progress-count">0/0</span>
+      </div>
+      <div class="h-1.5 w-full rounded bg-slate-800 overflow-hidden">
+        <div id="progress-bar" class="h-full w-0 rounded bg-indigo-500 transition-all duration-500"></div>
+      </div>
+    </div>
+  </header>
+
+  <!-- ======================= Баннер: LLM офлайн ======================= -->
+  <div id="ollama-banner" class="hidden mx-auto mt-4 max-w-5xl px-4">
+    <div class="flex flex-wrap items-center gap-3 rounded-xl border border-amber-500/40 bg-amber-500/10 px-4 py-3 text-sm text-amber-200">
+      <span>LLM (Ollama) недоступна — генерация писем будет ошибочной. Запустите Ollama и повторите генерацию на карточке.</span>
+      <button id="btn-recheck" class="rounded-lg border border-amber-500/50 px-3 py-1 text-xs transition-colors hover:bg-amber-500/20">
+        Проверить снова
+      </button>
+    </div>
+  </div>
+
+  <!-- ======================= Main ======================= -->
+  <main class="mx-auto max-w-5xl px-4 py-6">
+
+    <!-- Фильтры -->
+    <div class="flex flex-wrap items-center gap-2 mb-4">
+      <nav id="tabs" class="flex flex-wrap gap-1 rounded-lg bg-slate-900 p-1 text-sm"></nav>
+      <input id="f-q" type="search" placeholder="Поиск по названию / компании…"
+        class="w-56 rounded-lg border border-slate-800 bg-slate-900 px-3 py-1.5 text-sm outline-none focus:border-indigo-500 placeholder:text-slate-600">
+      <span id="count" class="ml-auto text-xs text-slate-500"></span>
+    </div>
+
+    <!-- Карточки -->
+    <section id="cards" class="space-y-3"></section>
+
+    <!-- Пустое состояние -->
+    <div id="empty" class="hidden flex-col items-center justify-center gap-3 py-20 text-center">
+      <div class="text-4xl text-slate-700">⌀</div>
+      <p class="text-slate-400">Вакансий пока нет.</p>
+      <p class="text-sm text-slate-600">Нажмите «Запустить поиск» — агент соберёт вакансии с hh.ru в базу. Письмо генерируется по кнопке «Сгенерировать письмо» на карточке.</p>
+    </div>
+  </main>
+
+  <!-- ======================= Footer ======================= -->
+  <footer class="mx-auto max-w-5xl px-4 pb-8 text-xs text-slate-600 space-y-1">
+    <div id="profile-line"></div>
+    <div>Горячие клавиши: <b class="text-slate-500">J/K</b> — навигация, <b class="text-slate-500">A</b> — лайк,
+      <b class="text-slate-500">R</b> — скип, <b class="text-slate-500">C</b> — копировать письмо, <b class="text-slate-500">O</b> — открыть вакансию</div>
+  </footer>
+
+  <!-- Тосты -->
+  <div id="toasts" class="fixed bottom-4 right-4 z-50 space-y-2 w-80 max-w-[90vw]"></div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
