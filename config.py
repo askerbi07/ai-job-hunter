@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 
 import yaml
@@ -12,15 +13,31 @@ BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
 
 
+def _as_int(name: str, default: int, minimum: int, maximum: int) -> int:
+    raw = os.getenv(name, str(default)).strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    if value < minimum:
+        return default
+    if value > maximum:
+        return default
+    return value
+
+
 def _parse_cron(expr: str) -> tuple[int, int]:
     """Разбирает cron 'M H * * *' в (минута, час). Валидные значения только они."""
     parts = (expr or "").split()
     if len(parts) < 2:
         return 0, 7
     try:
-        return int(parts[0]), int(parts[1])
+        minute, hour = int(parts[0]), int(parts[1])
     except ValueError:
         return 0, 7
+    if not (0 <= minute <= 59) or not (0 <= hour <= 23):
+        return 0, 7
+    return minute, hour
 
 
 @dataclass(frozen=True)
@@ -34,6 +51,8 @@ class Settings:
     db_path: Path
     profile_path: Path
     scheduler_enabled: bool
+    max_score_per_run: int
+    max_letters_per_run: int
 
 
 def _settings() -> Settings:
@@ -42,11 +61,13 @@ def _settings() -> Settings:
         ollama_model=os.getenv("OLLAMA_MODEL", "qwen2.5:14b-instruct"),
         ollama_api_key=os.getenv("OLLAMA_API_KEY", "ollama"),
         hh_user_agent=os.getenv("HH_USER_AGENT", "AIJobHunter/1.0 (local)"),
-        score_threshold=int(os.getenv("SCORE_THRESHOLD", "7")),
+        score_threshold=_as_int("SCORE_THRESHOLD", 7, 1, 10),
         run_cron=_parse_cron(os.getenv("RUN_CRON", "0 7 * * *")),
         db_path=(BASE_DIR / os.getenv("DB_PATH", "data/jobs.db")).resolve(),
         profile_path=(BASE_DIR / os.getenv("PROFILE_PATH", "profile.yaml")).resolve(),
         scheduler_enabled=os.getenv("SCHEDULER_ENABLED", "1").lower() not in ("0", "false", "no"),
+        max_score_per_run=_as_int("MAX_SCORE_PER_RUN", 25, 0, 1000),
+        max_letters_per_run=_as_int("MAX_LETTERS_PER_RUN", 5, 0, 100),
     )
 
 

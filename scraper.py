@@ -60,7 +60,7 @@ SCRAPE_QUERIES = [
     if item.strip()
 ][:8]
 
-ProgressCallback = Callable[[str, int, int], Awaitable[None]]
+ProgressCallback = Callable[[str, int, int, int], Awaitable[None]]
 
 
 @dataclass(slots=True)
@@ -68,6 +68,7 @@ class SourceResult:
     items: list[dict] = field(default_factory=list)
     fetched: int = 0
     errors: list[str] = field(default_factory=list)
+    known: set[tuple[str, str]] = field(default_factory=set)
 
 
 @dataclass(slots=True)
@@ -76,6 +77,7 @@ class ScrapeReport:
     fetched: int = 0
     filtered: int = 0
     errors: dict[str, str] = field(default_factory=dict)
+    known: set[tuple[str, str]] = field(default_factory=set)
 
 
 class ScraperError(RuntimeError):
@@ -575,8 +577,16 @@ def _hh_tags(description: str) -> list[str]:
     return _token_hits(description, IT_TOKENS)[:20]
 
 
-async def scrape_hh(session: requests.AsyncSession) -> SourceResult:
+async def scrape_hh(
+    session: requests.AsyncSession,
+    known_keys: set[tuple[str, str]] | None = None,
+) -> SourceResult:
     result = SourceResult()
+    known_hh = {
+        source_id
+        for source, source_id in known_keys or set()
+        if source == "hh"
+    }
     params = {
         "text": HH_QUERY,
         "area": HH_AREA,
@@ -611,13 +621,19 @@ async def scrape_hh(session: requests.AsyncSession) -> SourceResult:
     async def process(item: dict) -> dict | None:
         if _is_non_it_title(item["title"]):
             return None
+
+        is_known = item["source_id"] in known_hh
         detail: dict = {}
-        async with semaphore:
-            try:
-                detail = await _hh_detail(session, item["source_id"])
-            except Exception as exc:
-                if len(result.errors) < 3:
-                    result.errors.append(f"detail {item['source_id']}: {str(exc)[:160]}")
+
+        if is_known:
+            result.known.add(("hh", item["source_id"]))
+        else:
+            async with semaphore:
+                try:
+                    detail = await _hh_detail(session, item["source_id"])
+                except Exception as exc:
+                    if len(result.errors) < 3:
+                        result.errors.append(f"detail {item['source_id']}: {str(exc)[:160]}")
 
         title = detail.get("title") or item["title"]
         company = detail.get("company") or item["company"]
@@ -625,7 +641,10 @@ async def scrape_hh(session: requests.AsyncSession) -> SourceResult:
         tags = _hh_tags(description)
         accepted, score, _ = is_it_vacancy(title, tags, description)
         if not accepted:
-            return None
+            if is_known:
+                accepted, score = True, 0
+            else:
+                return None
 
         return _build_vacancy(
             source="hh",
@@ -745,8 +764,16 @@ async def _habr_detail(session: requests.AsyncSession, url: str) -> dict:
     }
 
 
-async def scrape_habr(session: requests.AsyncSession) -> SourceResult:
+async def scrape_habr(
+    session: requests.AsyncSession,
+    known_keys: set[tuple[str, str]] | None = None,
+) -> SourceResult:
     result = SourceResult()
+    known_habr = {
+        source_id
+        for source, source_id in known_keys or set()
+        if source == "habr"
+    }
     raw_by_id: dict[str, dict] = {}
     order: list[str] = []
 
@@ -787,22 +814,26 @@ async def scrape_habr(session: requests.AsyncSession) -> SourceResult:
         if not parsed:
             return None
 
-        accepted, _, _ = is_it_vacancy(parsed["title"], parsed["tags"], "")
-        if not accepted:
-            return None
-
+        is_known = parsed["source_id"] in known_habr
         detail: dict = {}
-        async with semaphore:
-            try:
-                detail = await _habr_detail(session, parsed["url"])
-            except Exception as exc:
-                if len(result.errors) < 3:
-                    result.errors.append(f"detail {parsed['source_id']}: {str(exc)[:160]}")
+
+        if is_known:
+            result.known.add(("habr", parsed["source_id"]))
+        else:
+            async with semaphore:
+                try:
+                    detail = await _habr_detail(session, parsed["url"])
+                except Exception as exc:
+                    if len(result.errors) < 3:
+                        result.errors.append(f"detail {parsed['source_id']}: {str(exc)[:160]}")
 
         description = detail.get("description") or ""
         accepted, score, _ = is_it_vacancy(parsed["title"], parsed["tags"], description)
         if not accepted:
-            return None
+            if is_known:
+                accepted, score = True, 0
+            else:
+                return None
 
         return _build_vacancy(
             source="habr",
@@ -831,8 +862,16 @@ async def scrape_habr(session: requests.AsyncSession) -> SourceResult:
 # --------------------------------------------------------------- remoteok
 
 
-async def scrape_remoteok(session: requests.AsyncSession) -> SourceResult:
+async def scrape_remoteok(
+    session: requests.AsyncSession,
+    known_keys: set[tuple[str, str]] | None = None,
+) -> SourceResult:
     result = SourceResult()
+    known_remoteok = {
+        source_id
+        for source, source_id in known_keys or set()
+        if source == "remoteok"
+    }
     try:
         resp = await _get(
             session,
@@ -862,6 +901,10 @@ async def scrape_remoteok(session: requests.AsyncSession) -> SourceResult:
         accepted, score, _ = is_it_vacancy(title, tags, description)
         if not accepted:
             continue
+
+        source_id = str(item.get("id"))
+        if source_id in known_remoteok:
+            result.known.add(("remoteok", source_id))
 
         salary_from = _int_or_none(item.get("salary_min"))
         salary_to = _int_or_none(item.get("salary_max"))
@@ -905,18 +948,26 @@ async def scrape_remoteok(session: requests.AsyncSession) -> SourceResult:
 
 
 async def _notify(
-    callback: ProgressCallback | None, phase: str, fetched: int, filtered: int
+    callback: ProgressCallback | None,
+    phase: str,
+    fetched: int,
+    filtered: int,
+    known: int,
 ) -> None:
     if callback is None:
         return
     try:
-        await callback(phase, fetched, filtered)
+        await callback(phase, fetched, filtered, known)
     except Exception:
         log.warning("progress callback failed", exc_info=True)
 
 
-async def scrape_all(on_progress: ProgressCallback | None = None) -> ScrapeReport:
+async def scrape_all(
+    on_progress: ProgressCallback | None = None,
+    known_keys: set[tuple[str, str]] | None = None,
+) -> ScrapeReport:
     report = ScrapeReport()
+    report.known = set()
     session = new_session()
     sources = (
         ("hh", scrape_hh),
@@ -925,28 +976,30 @@ async def scrape_all(on_progress: ProgressCallback | None = None) -> ScrapeRepor
     )
     try:
         for name, func in sources:
-            await _notify(on_progress, f"fetch_{name}", report.fetched, report.filtered)
+            await _notify(on_progress, f"fetch_{name}", report.fetched, report.filtered, len(report.known))
             try:
-                source_result = await func(session)
+                source_result = await func(session, known_keys)
             except Exception as exc:
                 log.exception("источник %s недоступен", name)
                 report.errors[name] = str(exc)[:300]
-                await _notify(on_progress, f"fetch_{name}", report.fetched, report.filtered)
+                await _notify(on_progress, f"fetch_{name}", report.fetched, report.filtered, len(report.known))
                 continue
 
             report.fetched += source_result.fetched
             report.filtered += len(source_result.items)
             report.items.extend(source_result.items)
+            report.known.update(source_result.known)
             if source_result.errors:
                 report.errors[name] = "; ".join(source_result.errors[:3])[:300]
             log.info(
-                "%s: fetched=%d accepted=%d errors=%d",
+                "%s: fetched=%d accepted=%d known=%d errors=%d",
                 name,
                 source_result.fetched,
                 len(source_result.items),
+                len(source_result.known),
                 len(source_result.errors),
             )
-            await _notify(on_progress, f"fetch_{name}", report.fetched, report.filtered)
+            await _notify(on_progress, f"fetch_{name}", report.fetched, report.filtered, len(report.known))
     finally:
         await session.close()
 

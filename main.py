@@ -1,38 +1,43 @@
-"""FastAPI backend приложения «AI Job Hunter»."""
+"""FastAPI backend for AI Job Hunter."""
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
-import os
-import uuid
+import time
 from contextlib import asynccontextmanager, suppress
-from datetime import datetime, timezone
 from pathlib import Path
-from typing import Literal
+from uuid import uuid4
 
-import aiosqlite
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from config import settings, load_profile, profile_hash
+from database import (
+    close_db,
+    complete_known_keys,
+    create_run,
+    get_vacancy,
+    init_db,
+    last_run,
+    get_run,
+    list_vacancies,
+    now_iso,
+    pending_letters,
+    save_analysis,
+    score_pending,
+    set_letter,
+    set_status,
+    stats,
+    touch_seen,
+    update_run,
+    upsert_vacancies,
+)
 from scraper import scrape_all
+from ai_agent import analyze_vacancy, check_ollama, generate_letter
 
 BASE_DIR = Path(__file__).resolve().parent
-DB_PATH = (BASE_DIR / os.getenv("DB_PATH", "data/jobs.db")).resolve()
-
-VALID_STATUS = {"new", "liked", "rejected", "applied", "archived"}
-VALID_SOURCES = {"hh", "habr", "remoteok"}
-RUN_FIELDS = {
-    "phase",
-    "fetched",
-    "filtered",
-    "saved",
-    "errors_json",
-    "error",
-    "finished_at",
-}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -40,403 +45,199 @@ logging.basicConfig(
 )
 log = logging.getLogger("app")
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS vacancies (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    source        TEXT NOT NULL CHECK (source IN ('hh', 'habr', 'remoteok')),
-    source_id     TEXT NOT NULL,
-    title         TEXT NOT NULL,
-    company       TEXT NOT NULL DEFAULT '',
-    url           TEXT NOT NULL,
-    location      TEXT,
-    salary_from   INTEGER,
-    salary_to     INTEGER,
-    currency      TEXT,
-    salary_period TEXT CHECK (salary_period IN ('month', 'year') OR salary_period IS NULL),
-    published_at  TEXT,
-    description   TEXT NOT NULL DEFAULT '',
-    tags_json     TEXT NOT NULL DEFAULT '[]',
-    remote        INTEGER NOT NULL DEFAULT 0 CHECK (remote IN (0, 1)),
-    it_score      INTEGER NOT NULL DEFAULT 0,
-    status        TEXT NOT NULL DEFAULT 'new'
-                  CHECK (status IN ('new', 'liked', 'rejected', 'applied', 'archived')),
-    first_seen    TEXT NOT NULL,
-    last_seen     TEXT NOT NULL,
-    raw_json      TEXT,
-    UNIQUE (source, source_id)
-);
-
-CREATE INDEX IF NOT EXISTS idx_vacancies_source     ON vacancies (source);
-CREATE INDEX IF NOT EXISTS idx_vacancies_status     ON vacancies (status);
-CREATE INDEX IF NOT EXISTS idx_vacancies_score      ON vacancies (it_score);
-CREATE INDEX IF NOT EXISTS idx_vacancies_published  ON vacancies (published_at);
-
-CREATE TABLE IF NOT EXISTS runs (
-    id           TEXT PRIMARY KEY,
-    started_at   TEXT NOT NULL,
-    finished_at  TEXT,
-    phase        TEXT NOT NULL DEFAULT 'queued',
-    fetched      INTEGER NOT NULL DEFAULT 0,
-    filtered     INTEGER NOT NULL DEFAULT 0,
-    saved        INTEGER NOT NULL DEFAULT 0,
-    errors_json  TEXT NOT NULL DEFAULT '[]',
-    error        TEXT
-);
-"""
-
-UPSERT_SQL = """
-INSERT INTO vacancies (
-    source, source_id, title, company, url, location,
-    salary_from, salary_to, currency, salary_period, published_at,
-    description, tags_json, remote, it_score, status,
-    first_seen, last_seen, raw_json
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'new', ?, ?, ?)
-ON CONFLICT(source, source_id) DO UPDATE SET
-    title = excluded.title,
-    company = excluded.company,
-    url = excluded.url,
-    location = excluded.location,
-    salary_from = excluded.salary_from,
-    salary_to = excluded.salary_to,
-    currency = excluded.currency,
-    salary_period = excluded.salary_period,
-    published_at = excluded.published_at,
-    description = excluded.description,
-    tags_json = excluded.tags_json,
-    remote = excluded.remote,
-    it_score = excluded.it_score,
-    last_seen = excluded.last_seen,
-    raw_json = excluded.raw_json
-"""
-
-_db: aiosqlite.Connection | None = None
-_db_lock = asyncio.Lock()
-_write_lock = asyncio.Lock()
+_ai_health_cache: dict | None = None
+_ai_health_ts: float | None = None
+_profile_cache: tuple[dict | None, str | None] | None = None
+_profile_ts: float | None = None
 _run_task: asyncio.Task | None = None
 _run_id: str | None = None
-_scrape_lock = asyncio.Lock()
+_scheduler = None
+
+_SCRAPE_LOCK = asyncio.Lock()
 
 
-def now_iso() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+async def _get_profile_cached(force: bool = False) -> tuple[dict | None, str | None]:
+    global _profile_cache, _profile_ts
 
+    now = time.monotonic()
+    if not force and _profile_cache is not None and _profile_ts is not None:
+        if now - _profile_ts < 30.0:
+            return _profile_cache
 
-async def get_db() -> aiosqlite.Connection:
-    global _db
-    if _db is not None:
-        return _db
-
-    async with _db_lock:
-        if _db is not None:
-            return _db
-
-        DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-        conn = await aiosqlite.connect(str(DB_PATH))
-        try:
-            conn.row_factory = aiosqlite.Row
-            await conn.execute("PRAGMA journal_mode=WAL")
-            await conn.execute("PRAGMA busy_timeout=5000")
-            await conn.execute("PRAGMA foreign_keys=ON")
-            _db = conn
-        except Exception:
-            await conn.close()
-            raise
-        return _db
-
-
-async def init_db() -> None:
-    db = await get_db()
-    await db.executescript(SCHEMA)
-    await db.commit()
-
-
-async def close_db() -> None:
-    global _db
-    if _db is not None:
-        await _db.close()
-        _db = None
-
-
-async def upsert_vacancies(items: list[dict]) -> int:
-    rows: list[tuple] = []
-    now = now_iso()
-
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        source = item.get("source")
-        source_id = item.get("source_id")
-        title = item.get("title")
-        url = item.get("url")
-        if source not in VALID_SOURCES or not source_id or not title or not url:
-            continue
-
-        tags = item.get("tags")
-        if not isinstance(tags, list):
-            tags = []
-        try:
-            tags_json = json.dumps(tags, ensure_ascii=False)
-        except (TypeError, ValueError):
-            tags_json = "[]"
-
-        raw = item.get("raw")
-        if not isinstance(raw, dict):
-            raw = {}
-        try:
-            raw_json = json.dumps(raw, ensure_ascii=False)
-        except (TypeError, ValueError):
-            raw_json = "{}"
-
-        salary_period = item.get("salary_period")
-        if salary_period not in ("month", "year"):
-            salary_period = None
-
-        try:
-            it_score = int(item.get("it_score") or 0)
-        except (TypeError, ValueError):
-            it_score = 0
-
-        rows.append(
-            (
-                source,
-                str(source_id),
-                str(title),
-                str(item.get("company") or ""),
-                str(url),
-                item.get("location"),
-                item.get("salary_from"),
-                item.get("salary_to"),
-                item.get("currency"),
-                salary_period,
-                item.get("published_at"),
-                str(item.get("description") or ""),
-                tags_json,
-                1 if item.get("remote") else 0,
-                it_score,
-                now,
-                now,
-                raw_json,
-            )
-        )
-
-    if not rows:
-        return 0
-
-    async with _write_lock:
-        db = await get_db()
-        try:
-            await db.executemany(UPSERT_SQL, rows)
-            await db.commit()
-        except Exception:
-            await db.rollback()
-            raise
-    return len(rows)
-
-
-def _serialize(row: aiosqlite.Row) -> dict:
-    data = dict(row)
     try:
-        tags = json.loads(data.get("tags_json") or "[]")
-    except (TypeError, ValueError, json.JSONDecodeError):
-        tags = []
-    data["tags"] = tags if isinstance(tags, list) else []
-    data["remote"] = bool(data.get("remote"))
-    data.pop("tags_json", None)
-    data.pop("raw_json", None)
-    return data
+        prof = load_profile()
+        result = (prof, profile_hash(prof))
+    except Exception as exc:
+        log.warning("AI: load profile failed: %s", exc)
+        result = (None, None)
+
+    _profile_ts = now
+    _profile_cache = result
+    return result
 
 
-async def list_vacancies(
-    page: int,
-    page_size: int,
-    source: str | None = None,
-    status: str | None = None,
-    q: str | None = None,
-    remote: bool | None = None,
-    min_salary: int | None = None,
-) -> tuple[list, int]:
-    db = await get_db()
-    where: list[str] = []
-    params: list = []
+async def _ai_health() -> dict:
+    global _ai_health_cache, _ai_health_ts
 
-    if source:
-        where.append("source = ?")
-        params.append(source)
-    if status:
-        where.append("status = ?")
-        params.append(status)
-    if q:
-        pattern = f"%{q}%"
-        where.append("(title LIKE ? OR company LIKE ? OR description LIKE ?)")
-        params.extend([pattern, pattern, pattern])
-    if remote is not None:
-        where.append("remote = ?")
-        params.append(1 if remote else 0)
-    if min_salary is not None:
-        where.append("(salary_from >= ? OR salary_to >= ?)")
-        params.extend([min_salary, min_salary])
+    now = time.monotonic()
+    if _ai_health_cache is not None and _ai_health_ts is not None:
+        if now - _ai_health_ts < 10.0:
+            return _ai_health_cache
 
-    where_sql = f" WHERE {' AND '.join(where)}" if where else ""
+    try:
+        check = await check_ollama()
+    except Exception as exc:
+        check = {"online": False, "models": [], "configured": False, "error": str(exc)[:200]}
 
-    count_cursor = await db.execute(
-        f"SELECT COUNT(*) AS total FROM vacancies{where_sql}", params
-    )
-    count_row = await count_cursor.fetchone()
-    await count_cursor.close()
-    total = int(count_row["total"]) if count_row else 0
+    profile, current_hash = await _get_profile_cached(force=False)
+    online = bool(check.get("online"))
+    configured = bool(check.get("configured"))
+    ready = online and configured and profile is not None
 
-    offset = (page - 1) * page_size
-    cursor = await db.execute(
-        f"""
-        SELECT * FROM vacancies{where_sql}
-        ORDER BY (published_at IS NULL) ASC, published_at DESC, first_seen DESC, id DESC
-        LIMIT ? OFFSET ?
-        """,
-        [*params, page_size, offset],
-    )
-    rows = await cursor.fetchall()
-    await cursor.close()
-    return rows, total
+    if ready:
+        ai_status = "ready"
+    elif not online:
+        ai_status = "offline"
+    elif not configured:
+        ai_status = "no model"
+    else:
+        ai_status = "no profile"
 
-
-async def get_vacancy(vacancy_id: int):
-    db = await get_db()
-    cursor = await db.execute("SELECT * FROM vacancies WHERE id = ?", (vacancy_id,))
-    row = await cursor.fetchone()
-    await cursor.close()
-    return row
-
-
-async def set_status(vacancy_id: int, status: str):
-    async with _write_lock:
-        db = await get_db()
-        try:
-            cursor = await db.execute(
-                "UPDATE vacancies SET status = ? WHERE id = ?",
-                (status, vacancy_id),
-            )
-            await db.commit()
-            changed = cursor.rowcount
-            await cursor.close()
-        except Exception:
-            await db.rollback()
-            raise
-    if not changed:
-        return None
-    return await get_vacancy(vacancy_id)
-
-
-async def stats() -> dict:
-    db = await get_db()
-    by_source = {name: 0 for name in VALID_SOURCES}
-    by_status = {name: 0 for name in VALID_STATUS}
-
-    cursor = await db.execute(
-        "SELECT source, COUNT(*) AS cnt FROM vacancies GROUP BY source"
-    )
-    for row in await cursor.fetchall():
-        if row["source"] in by_source:
-            by_source[row["source"]] = int(row["cnt"])
-    await cursor.close()
-
-    cursor = await db.execute(
-        "SELECT status, COUNT(*) AS cnt FROM vacancies GROUP BY status"
-    )
-    for row in await cursor.fetchall():
-        if row["status"] in by_status:
-            by_status[row["status"]] = int(row["cnt"])
-    await cursor.close()
-
-    return {
-        "total": sum(by_source.values()),
-        "by_source": by_source,
-        "by_status": by_status,
+    result = {
+        "ai_status": ai_status,
+        "ai_ready": ready,
+        "ai_model": settings.ollama_model,
+        "ai_error": check.get("error") if not online else None,
     }
 
+    _ai_health_ts = now
+    _ai_health_cache = result
+    return result
 
-async def create_run(run_id: str) -> None:
-    async with _write_lock:
-        db = await get_db()
+
+async def _ai_pipeline(run_id: str) -> tuple[int, int]:
+    health = await _ai_health()
+    if not health["ai_ready"]:
+        return 0, 0
+
+    profile, current_hash = await _get_profile_cached(force=True)
+    if profile is None:
+        return 0, 0
+
+    await update_run(run_id, phase="score")
+    analyzed = 0
+
+    for vac in await score_pending(current_hash, settings.max_score_per_run):
         try:
-            await db.execute(
-                "INSERT INTO runs (id, started_at, phase) VALUES (?, ?, 'queued')",
-                (run_id, now_iso()),
-            )
-            await db.commit()
-        except Exception:
-            await db.rollback()
-            raise
+            analysis = await analyze_vacancy(profile, vac)
+        except Exception as exc:
+            log.warning("AI scoring failed for %s: %s", vac.get("id"), exc)
+            continue
+
+        if await save_analysis(vac["id"], analysis, current_hash):
+            analyzed += 1
+
+    await update_run(run_id, phase="letters")
+    letters = 0
+
+    for vac in await pending_letters(current_hash, settings.score_threshold, settings.max_letters_per_run):
+        letter, error = await generate_letter(profile, vac)
+        if letter and not error:
+            await set_letter(vac["id"], letter, "ready")
+            letters += 1
+        else:
+            await set_letter(vac["id"], None, "failed")
+
+    if analyzed:
+        await update_run(run_id, analyzed=analyzed)
+    if letters:
+        await update_run(run_id, letters=letters)
+
+    return analyzed, letters
 
 
-async def update_run(run_id: str, **fields) -> None:
-    invalid = set(fields) - RUN_FIELDS
-    if invalid:
-        raise ValueError(f"Недопустимые поля прогона: {', '.join(sorted(invalid))}")
-    if not fields:
-        return
-
-    assignments = ", ".join(f"{name} = ?" for name in fields)
-    values = [value for value in fields.values()]
-
-    async with _write_lock:
-        db = await get_db()
-        try:
-            await db.execute(
-                f"UPDATE runs SET {assignments} WHERE id = ?",
-                [*values, run_id],
-            )
-            await db.commit()
-        except Exception:
-            await db.rollback()
-            raise
-
-
-async def get_run(run_id: str):
-    db = await get_db()
-    cursor = await db.execute("SELECT * FROM runs WHERE id = ?", (run_id,))
-    row = await cursor.fetchone()
-    await cursor.close()
-    return row
-
-
-async def last_run():
-    db = await get_db()
-    cursor = await db.execute(
-        "SELECT * FROM runs ORDER BY started_at DESC, id DESC LIMIT 1"
-    )
-    row = await cursor.fetchone()
-    await cursor.close()
-    return row
-
-
-async def _run_scrape(run_id: str) -> None:
-    async def on_progress(phase: str, fetched: int, filtered: int) -> None:
-        await update_run(run_id, phase=phase, fetched=fetched, filtered=filtered)
+async def _run_pipeline(run_id: str) -> None:
+    async def on_progress(phase: str, fetched: int, filtered: int, known: int) -> None:
+        await update_run(run_id, phase=phase, fetched=fetched, filtered=filtered, known=known)
 
     try:
-        report = await scrape_all(on_progress)
+        known_keys = await complete_known_keys()
+        report = await scrape_all(on_progress, known_keys=known_keys)
+
+        known = getattr(report, "known", set()) or set()
+        await touch_seen(known)
+
+        saved = await upsert_vacancies(report.items)
+        known_count = len(known)
+        errors = getattr(report, "errors", {}) or {}
+
         await update_run(
             run_id,
-            phase="save",
+            phase="score",
             fetched=report.fetched,
             filtered=report.filtered,
-            errors_json=json.dumps(report.errors, ensure_ascii=False),
+            saved=saved,
+            known=known_count,
+            errors_json=errors,
         )
-        saved = await upsert_vacancies(report.items)
+
+        analyzed, letters = await _ai_pipeline(run_id)
+
         await update_run(
             run_id,
             phase="done",
             finished_at=now_iso(),
+            fetched=report.fetched,
+            filtered=report.filtered,
             saved=saved,
+            known=known_count,
+            analyzed=analyzed,
+            letters=letters,
         )
     except Exception as exc:
-        log.exception("Прогон сбора %s завершился ошибкой", run_id)
+        log.exception("Run %s failed", run_id, exc_info=True)
         await update_run(
             run_id,
             phase="error",
             finished_at=now_iso(),
-            error=str(exc)[:1000],
+            error=str(exc)[:300],
         )
+
+
+async def _start_run_task() -> tuple[str, bool]:
+    global _run_task, _run_id
+
+    async with _SCRAPE_LOCK:
+        if _run_task is not None and not _run_task.done():
+            return _run_id or "", False
+
+        rid = await create_run()
+        _run_id = rid
+        _run_task = asyncio.create_task(_run_pipeline(rid))
+        return rid, True
+
+
+async def _scheduled_run() -> None:
+    try:
+        await _start_run_task()
+    except Exception:
+        log.exception("Scheduled run start failed", exc_info=True)
+
+
+async def _shutdown_scheduler() -> None:
+    global _run_task, _scheduler
+
+    if _run_task is not None and not _run_task.done():
+        _run_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await _run_task
+
+    sched = _scheduler
+    if sched is not None:
+        try:
+            sched.shutdown()
+        except Exception:
+            log.exception("Scheduler shutdown failed", exc_info=True)
 
 
 class StatusUpdate(BaseModel):
@@ -445,7 +246,7 @@ class StatusUpdate(BaseModel):
 
 class VacancyOut(BaseModel):
     id: int
-    source: Literal["hh", "habr", "remoteok"]
+    source: str
     source_id: str
     title: str
     company: str
@@ -454,15 +255,25 @@ class VacancyOut(BaseModel):
     salary_from: int | None = None
     salary_to: int | None = None
     currency: str | None = None
-    salary_period: Literal["month", "year"] | None = None
+    salary_period: str | None = None
     published_at: str | None = None
     description: str
     tags: list[str] = Field(default_factory=list)
     remote: bool
     it_score: int
-    status: Literal["new", "liked", "rejected", "applied", "archived"]
-    first_seen: str
-    last_seen: str
+    status: str
+    first_seen: str | None = None
+    last_seen: str | None = None
+    ai_score: int | None = None
+    ai_verdict: str | None = None
+    matched: list[str] = Field(default_factory=list)
+    missing: list[str] = Field(default_factory=list)
+    red_flags: list[str] = Field(default_factory=list)
+    ai_reason: str | None = None
+    analyzed_at: str | None = None
+    profile_hash: str | None = None
+    cover_letter: str | None = None
+    letter_status: str | None = None
 
 
 class PageOut(BaseModel):
@@ -475,26 +286,39 @@ class PageOut(BaseModel):
 
 class RunOut(BaseModel):
     id: str
-    started_at: str
+    started_at: str | None = None
     finished_at: str | None = None
     phase: str
-    fetched: int
-    filtered: int
-    saved: int
-    errors_json: str
+    fetched: int = 0
+    filtered: int = 0
+    saved: int = 0
+    known: int = 0
+    analyzed: int = 0
+    letters: int = 0
+    errors_json: str = "{}"
     error: str | None = None
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def lifespan(_: FastAPI):
+    global _scheduler
+
     await init_db()
-    yield
-    task = _run_task
-    if task is not None and not task.done():
-        task.cancel()
-        with suppress(asyncio.CancelledError):
-            await task
-    await close_db()
+
+    if settings.scheduler_enabled:
+        try:
+            from scheduler import start_scheduler
+
+            _scheduler = start_scheduler(_scheduled_run)
+        except Exception:
+            log.exception("Scheduler startup failed", exc_info=True)
+            _scheduler = None
+
+    try:
+        yield
+    finally:
+        await _shutdown_scheduler()
+        await close_db()
 
 
 app = FastAPI(title="AI Job Hunter", version="2.0.0", lifespan=lifespan)
@@ -516,23 +340,23 @@ async def api_vacancies(
     remote: bool | None = None,
     min_salary: int | None = Query(None, ge=0),
 ):
-    if source is not None and source not in VALID_SOURCES:
-        raise HTTPException(400, f"Недопустимый источник: {source}")
-    if status is not None and status not in VALID_STATUS:
-        raise HTTPException(400, f"Недопустимый статус: {status}")
+    if source is not None and source not in {"hh", "habr", "remoteok"}:
+        raise HTTPException(400, "unsupported source value")
+    if status is not None and status not in {"new", "liked", "rejected", "applied", "archived"}:
+        raise HTTPException(400, "unsupported status value")
 
     rows, total = await list_vacancies(
-        page=page,
-        page_size=page_size,
-        source=source,
         status=status,
+        source=source,
         q=q.strip() if q else None,
         remote=remote,
+        page=page,
+        page_size=page_size,
         min_salary=min_salary,
     )
     pages = (total + page_size - 1) // page_size if total else 0
     return {
-        "items": [_serialize(row) for row in rows],
+        "items": rows,
         "page": page,
         "page_size": page_size,
         "total": total,
@@ -544,41 +368,32 @@ async def api_vacancies(
 async def api_vacancy(vacancy_id: int):
     row = await get_vacancy(vacancy_id)
     if row is None:
-        raise HTTPException(404, "vacancy не найдена")
-    return _serialize(row)
+        raise HTTPException(404, "vacancy not found")
+    return row
 
 
 @app.patch("/api/vacancies/{vacancy_id}", response_model=VacancyOut)
 async def api_set_status(vacancy_id: int, payload: StatusUpdate):
-    if payload.status not in VALID_STATUS:
-        raise HTTPException(400, f"Недопустимый статус: {payload.status}")
+    if payload.status not in {"new", "liked", "rejected", "applied", "archived"}:
+        raise HTTPException(400, "unsupported status value")
     row = await set_status(vacancy_id, payload.status)
     if row is None:
-        raise HTTPException(404, "vacancy не найдена")
-    return _serialize(row)
+        raise HTTPException(404, "vacancy not found")
+    return row
 
 
 @app.post("/api/scrape")
 async def api_scrape():
-    global _run_task, _run_id
-
-    async with _scrape_lock:
-        if _run_task is not None and not _run_task.done():
-            return {"run_id": _run_id, "started": False}
-
-        rid = uuid.uuid4().hex[:12]
-        await create_run(rid)
-        _run_id = rid
-        _run_task = asyncio.create_task(_run_scrape(rid))
-        return {"run_id": rid, "started": True}
+    run_id, started = await _start_run_task()
+    return {"run_id": run_id, "started": started}
 
 
 @app.get("/api/runs/{run_id}", response_model=RunOut)
 async def api_run(run_id: str):
     row = await get_run(run_id)
     if row is None:
-        raise HTTPException(404, "run не найден")
-    return dict(row)
+        raise HTTPException(404, "run not found")
+    return row
 
 
 @app.get("/api/stats")
@@ -589,9 +404,18 @@ async def api_stats():
 @app.get("/api/health")
 async def api_health():
     current = await stats()
-    row = await last_run()
+    run = await last_run()
+    ai = await _ai_health()
     return {
         "status": "ok",
         "total": current["total"],
-        "last_run": dict(row) if row is not None else None,
+        "by_source": current["by_source"],
+        "by_status": current["by_status"],
+        "scored": current["scored"],
+        "letters_ready": current["letters_ready"],
+        "last_run": run,
+        "ai_status": ai["ai_status"],
+        "ai_ready": ai["ai_ready"],
+        "ai_model": ai["ai_model"],
+        "ai_error": ai["ai_error"],
     }

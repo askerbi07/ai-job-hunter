@@ -164,14 +164,22 @@ def _profile_block(profile: dict) -> str:
 
 
 def _vacancy_block(row) -> str:
-    salary = f"{row['salary_from'] or '?'} - {row['salary_to'] or '?'} {row['currency'] or ''}".strip()
+    salary_from = row.get("salary_from")
+    salary_to = row.get("salary_to")
+    salary = f"{salary_from if salary_from is not None else '?'} - {salary_to if salary_to is not None else '?'} {row.get('currency') or ''}".strip()
+    salary_period = row.get("salary_period")
+    if salary_period:
+        salary = f"{salary} per {salary_period}".strip()
     return json.dumps(
         {
-            "title": row["title"],
-            "company": row["company"],
-            "area": row["area"],
+            "title": row.get("title") or "",
+            "company": row.get("company") or "",
+            "location": row.get("location") or "",
             "salary": salary,
-            "description": (row["description"] or "")[:DESC_LIMIT],
+            "salary_period": salary_period or "",
+            "tags": row.get("tags") or [],
+            "remote": bool(row.get("remote")),
+            "description": (row.get("description") or "")[:DESC_LIMIT],
         },
         ensure_ascii=False,
         indent=2,

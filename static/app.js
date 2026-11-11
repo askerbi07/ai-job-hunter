@@ -36,9 +36,9 @@ const STATUS_META = {
 const TABS = [
   ["all", "Все"],
   ["new", "Новые"],
-  ["liked", "Лайки"],
-  ["rejected", "Скипы"],
-  ["applied", "Отклики"],
+  ["liked", "Liked"],
+  ["rejected", "Rejected"],
+  ["applied", "Applied"],
   ["archived", "Архив"],
 ];
 
@@ -48,16 +48,20 @@ const PHASES = {
   fetch_habr: "Сбор Habr Career…",
   fetch_remoteok: "Сбор RemoteOK…",
   save: "Сохранение в базу…",
+  score: "AI-реитинг…",
+  letters: "AI letters…",
   done: "Готово",
   error: "Ошибка",
 };
 
 const PHASE_PCT = {
   queued: 5,
-  fetch_hh: 25,
-  fetch_habr: 45,
-  fetch_remoteok: 65,
-  save: 85,
+  fetch_hh: 15,
+  fetch_habr: 30,
+  fetch_remoteok: 45,
+  save: 60,
+  score: 78,
+  letters: 92,
   done: 100,
   error: 100,
 };
@@ -463,6 +467,25 @@ function itClass(score) {
   return "border-slate-500/40 bg-slate-500/10 text-slate-300";
 }
 
+function aiClass(score) {
+  if (score >= 8) return "border-emerald-500/40 bg-emerald-500/10 text-emerald-300";
+  if (score >= 6) return "border-violet-500/40 bg-violet-500/10 text-violet-300";
+  return "border-slate-500/40 bg-slate-500/10 text-slate-300";
+}
+
+function aiVerdict(v) {
+  const verdict = String(v.ai_verdict || "").toLowerCase();
+  const labels = {
+    strong: "Strong",
+    stretch: "Stretch",
+    good: "Stretch",
+    weak: "Skip",
+    skip: "Skip",
+    rejected: "Skip",
+  };
+  return labels[verdict] || v.ai_verdict || "";
+}
+
 function card(v) {
   const article = el(
     "article",
@@ -488,6 +511,18 @@ function card(v) {
   badges.append(badge(status.label, status.cls));
   if (v.remote) badges.append(badge("Удалёнка", "border-cyan-500/40 bg-cyan-500/10 text-cyan-300"));
   badges.append(badge(`IT ${v.it_score}`, itClass(v.it_score)));
+  if (v.ai_score !== null && v.ai_score !== undefined) {
+    badges.append(badge(`AI ${v.ai_score}`, aiClass(v.ai_score)));
+  }
+  const verdict = aiVerdict(v);
+  if (verdict) {
+    badges.append(badge(`AI · ${verdict}`, "border-fuchsia-500/40 bg-fuchsia-500/10 text-fuchsia-300"));
+  }
+  if (v.letter_status === "ready") {
+    badges.append(badge("Cover ready", "border-amber-500/40 bg-amber-500/10 text-amber-300"));
+  } else if (v.letter_status === "failed") {
+    badges.append(badge("Cover failed", "border-rose-500/40 bg-rose-500/10 text-rose-300"));
+  }
   article.append(top, badges);
 
   const metaParts = [v.company, v.location, fmtSalary(v), fmtDate(v.published_at)].filter(Boolean);
@@ -586,9 +621,8 @@ function renderStats() {
   const target = $("#stats");
   if (!target) return;
   const bySource = state.stats.by_source || {};
-  target.textContent = `Всего: ${state.stats.total || 0} · hh.ru: ${bySource.hh || 0} · Habr: ${
-    bySource.habr || 0
-  } · RemoteOK: ${bySource.remoteok || 0}`;
+  target.textContent =
+    `Всего: ${state.stats.total || 0} · hh.ru: ${bySource.hh || 0} · Habr: ${bySource.habr || 0} · RemoteOK: ${bySource.remoteok || 0} · AI: ${state.stats.scored || 0} · Cover: ${state.stats.letters_ready || 0}`;
 }
 
 function pageNumbers(current, pages) {
@@ -737,7 +771,8 @@ async function loadHealth() {
       dot.classList.remove("bg-slate-600", "bg-emerald-500", "bg-rose-500");
       dot.classList.add(data.status === "ok" ? "bg-emerald-500" : "bg-rose-500");
     }
-    if (label) label.textContent = `Вакансий: ${data.total || 0}`;
+    const aiStatus = data.ai_status || "unknown";
+    if (label) label.textContent = `Вакансий: ${data.total || 0} · AI: ${aiStatus}`;
 
     const last = $("#last-run");
     if (last) {
@@ -796,9 +831,10 @@ function showProgressRun(run) {
     bar.style.width = `${Math.max(0, Math.min(100, percent))}%`;
   }
   if (count) {
-    count.textContent = `${run.fetched || 0} собрано · ${run.filtered || 0} IT · ${
-      run.saved || 0
-    } сохранено`;
+    count.textContent =
+      `${run.fetched || 0} собрано · ${run.filtered || 0} IT · ${run.saved || 0} сохран · ${
+        run.known || 0
+      } known · ${run.analyzed || 0} AI · ${run.letters || 0} cover`;
   }
   showProgress(true);
 }
@@ -823,11 +859,14 @@ function pollRun(runId) {
       if (run.error) {
         toast(`Сбор завершён с ошибкой: ${run.error}`, "err");
       } else {
-        toast(`Сбор завершён: сохранено ${run.saved} из ${run.fetched}`, "ok");
+        toast(
+          `Сбор завершён: сохранено ${run.saved || 0} из ${run.fetched || 0}; AI ${run.analyzed || 0}; cover ${run.letters || 0}`,
+          "ok"
+        );
       }
 
       try {
-        const errors = JSON.parse(run.errors_json || "[]");
+        const errors = JSON.parse(run.errors_json || "{}");
         if (errors && typeof errors === "object" && Object.keys(errors).length) {
           toast("Часть источников недоступна", "info");
         }
@@ -857,7 +896,7 @@ async function startScrape() {
     button.textContent = "Запуск…";
   }
   showProgress(true);
-  showProgressRun({ phase: "queued", fetched: 0, filtered: 0, saved: 0 });
+  showProgressRun({ phase: "queued", fetched: 0, filtered: 0, saved: 0, known: 0, analyzed: 0, letters: 0 });
 
   try {
     const result = await api("/api/scrape", { method: "POST" });
