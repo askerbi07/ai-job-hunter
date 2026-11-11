@@ -1,268 +1,597 @@
-"""Точка входа: FastAPI-приложение «AI Job Hunter».
-
-Запуск:
-    uvicorn main:app --reload --port 8000
-
-Разделение логики:
-    POST /api/run-agent                — ТОЛЬКО сбор вакансий с hh.ru и сохранение в БД
-    POST /api/vacancies/{id}/generate-letter — LLM-письмо по одной вакансии (по кнопке)
-
-Важно: run_id создаётся ОДИН раз в api_run_agent и пробрасывается в
-run_agent() — фронт опрашивает именно его по GET /api/run/{run_id}.
-"""
+"""FastAPI backend приложения «AI Job Hunter»."""
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
-import time
+import os
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Literal
 
-from fastapi import FastAPI, HTTPException
+import aiosqlite
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
-import database as db
-from ai_agent import check_ollama, generate_letter
-from config import BASE_DIR, load_profile, profile_hash, settings
-from scheduler import start_scheduler
-from scraper import fetch_details, fetch_search, new_session
+from scraper import scrape_all
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-log = logging.getLogger("app")
+BASE_DIR = Path(__file__).resolve().parent
+DB_PATH = (BASE_DIR / os.getenv("DB_PATH", "data/jobs.db")).resolve()
 
 VALID_STATUS = {"new", "liked", "rejected", "applied", "archived"}
+VALID_SOURCES = {"hh", "habr", "remoteok"}
+RUN_FIELDS = {
+    "phase",
+    "fetched",
+    "filtered",
+    "saved",
+    "errors_json",
+    "error",
+    "finished_at",
+}
 
-# Глобальный «бегунок» — одновременно только один прогон.
-_running: dict = {"task": None, "run_id": None}
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+log = logging.getLogger("app")
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS vacancies (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    source        TEXT NOT NULL CHECK (source IN ('hh', 'habr', 'remoteok')),
+    source_id     TEXT NOT NULL,
+    title         TEXT NOT NULL,
+    company       TEXT NOT NULL DEFAULT '',
+    url           TEXT NOT NULL,
+    location      TEXT,
+    salary_from   INTEGER,
+    salary_to     INTEGER,
+    currency      TEXT,
+    salary_period TEXT CHECK (salary_period IN ('month', 'year') OR salary_period IS NULL),
+    published_at  TEXT,
+    description   TEXT NOT NULL DEFAULT '',
+    tags_json     TEXT NOT NULL DEFAULT '[]',
+    remote        INTEGER NOT NULL DEFAULT 0 CHECK (remote IN (0, 1)),
+    it_score      INTEGER NOT NULL DEFAULT 0,
+    status        TEXT NOT NULL DEFAULT 'new'
+                  CHECK (status IN ('new', 'liked', 'rejected', 'applied', 'archived')),
+    first_seen    TEXT NOT NULL,
+    last_seen     TEXT NOT NULL,
+    raw_json      TEXT,
+    UNIQUE (source, source_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_vacancies_source     ON vacancies (source);
+CREATE INDEX IF NOT EXISTS idx_vacancies_status     ON vacancies (status);
+CREATE INDEX IF NOT EXISTS idx_vacancies_score      ON vacancies (it_score);
+CREATE INDEX IF NOT EXISTS idx_vacancies_published  ON vacancies (published_at);
+
+CREATE TABLE IF NOT EXISTS runs (
+    id           TEXT PRIMARY KEY,
+    started_at   TEXT NOT NULL,
+    finished_at  TEXT,
+    phase        TEXT NOT NULL DEFAULT 'queued',
+    fetched      INTEGER NOT NULL DEFAULT 0,
+    filtered     INTEGER NOT NULL DEFAULT 0,
+    saved        INTEGER NOT NULL DEFAULT 0,
+    errors_json  TEXT NOT NULL DEFAULT '[]',
+    error        TEXT
+);
+"""
+
+UPSERT_SQL = """
+INSERT INTO vacancies (
+    source, source_id, title, company, url, location,
+    salary_from, salary_to, currency, salary_period, published_at,
+    description, tags_json, remote, it_score, status,
+    first_seen, last_seen, raw_json
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'new', ?, ?, ?)
+ON CONFLICT(source, source_id) DO UPDATE SET
+    title = excluded.title,
+    company = excluded.company,
+    url = excluded.url,
+    location = excluded.location,
+    salary_from = excluded.salary_from,
+    salary_to = excluded.salary_to,
+    currency = excluded.currency,
+    salary_period = excluded.salary_period,
+    published_at = excluded.published_at,
+    description = excluded.description,
+    tags_json = excluded.tags_json,
+    remote = excluded.remote,
+    it_score = excluded.it_score,
+    last_seen = excluded.last_seen,
+    raw_json = excluded.raw_json
+"""
+
+_db: aiosqlite.Connection | None = None
+_db_lock = asyncio.Lock()
+_write_lock = asyncio.Lock()
+_run_task: asyncio.Task | None = None
+_run_id: str | None = None
+_scrape_lock = asyncio.Lock()
 
 
-def _new_run_id() -> str:
-    return uuid.uuid4().hex[:12]
+def now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-# ------------------------------------------------------------------ pipeline
+async def get_db() -> aiosqlite.Connection:
+    global _db
+    if _db is not None:
+        return _db
 
-async def run_agent(run_id: str) -> dict:
-    """Прогон сбора вакансий. Возвращает сводку. НЕ бросает исключения наружу:
-    строка runs всегда получает finished_at (и error при сбое) —
-    фронт опрашивает GET /api/run/{run_id} до finished_at.
-    """
-    started = time.time()
-    summary: dict = {"run_id": run_id, "fetched": 0, "new": 0, "errors": []}
-    await db.create_run(run_id, db.now_iso())
+    async with _db_lock:
+        if _db is not None:
+            return _db
+
+        DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+        conn = await aiosqlite.connect(str(DB_PATH))
+        try:
+            conn.row_factory = aiosqlite.Row
+            await conn.execute("PRAGMA journal_mode=WAL")
+            await conn.execute("PRAGMA busy_timeout=5000")
+            await conn.execute("PRAGMA foreign_keys=ON")
+            _db = conn
+        except Exception:
+            await conn.close()
+            raise
+        return _db
+
+
+async def init_db() -> None:
+    db = await get_db()
+    await db.executescript(SCHEMA)
+    await db.commit()
+
+
+async def close_db() -> None:
+    global _db
+    if _db is not None:
+        await _db.close()
+        _db = None
+
+
+async def upsert_vacancies(items: list[dict]) -> int:
+    rows: list[tuple] = []
+    now = now_iso()
+
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        source = item.get("source")
+        source_id = item.get("source_id")
+        title = item.get("title")
+        url = item.get("url")
+        if source not in VALID_SOURCES or not source_id or not title or not url:
+            continue
+
+        tags = item.get("tags")
+        if not isinstance(tags, list):
+            tags = []
+        try:
+            tags_json = json.dumps(tags, ensure_ascii=False)
+        except (TypeError, ValueError):
+            tags_json = "[]"
+
+        raw = item.get("raw")
+        if not isinstance(raw, dict):
+            raw = {}
+        try:
+            raw_json = json.dumps(raw, ensure_ascii=False)
+        except (TypeError, ValueError):
+            raw_json = "{}"
+
+        salary_period = item.get("salary_period")
+        if salary_period not in ("month", "year"):
+            salary_period = None
+
+        try:
+            it_score = int(item.get("it_score") or 0)
+        except (TypeError, ValueError):
+            it_score = 0
+
+        rows.append(
+            (
+                source,
+                str(source_id),
+                str(title),
+                str(item.get("company") or ""),
+                str(url),
+                item.get("location"),
+                item.get("salary_from"),
+                item.get("salary_to"),
+                item.get("currency"),
+                salary_period,
+                item.get("published_at"),
+                str(item.get("description") or ""),
+                tags_json,
+                1 if item.get("remote") else 0,
+                it_score,
+                now,
+                now,
+                raw_json,
+            )
+        )
+
+    if not rows:
+        return 0
+
+    async with _write_lock:
+        db = await get_db()
+        try:
+            await db.executemany(UPSERT_SQL, rows)
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
+    return len(rows)
+
+
+def _serialize(row: aiosqlite.Row) -> dict:
+    data = dict(row)
     try:
-        await _pipeline(run_id, summary)
-        await db.update_run(run_id, phase="done", finished_at=db.now_iso())
-    except Exception as e:  # noqa: BLE001 — не роняем сервер, пишем ошибку в run
-        log.exception("прогон %s упал", run_id)
-        summary["errors"].append(str(e))
-        await db.update_run(run_id, phase="done", finished_at=db.now_iso(), error=str(e)[:500])
-    log.info("прогон %s завершён за %.1fs", run_id, time.time() - started)
-    return summary
+        tags = json.loads(data.get("tags_json") or "[]")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        tags = []
+    data["tags"] = tags if isinstance(tags, list) else []
+    data["remote"] = bool(data.get("remote"))
+    data.pop("tags_json", None)
+    data.pop("raw_json", None)
+    return data
 
 
-async def _pipeline(run_id: str, summary: dict) -> None:
-    """Шаги прогона: только сбор (hh.ru) и сохранение в БД. LLM здесь не вызывается."""
-    # --- 1. сбор
-    await db.update_run(run_id, phase="fetch")
-    searches = await db.active_searches()
-    collected: list[dict] = []
-    async with new_session() as session:
-        for s in searches:
-            try:
-                collected.extend(await fetch_search(s, session=session))
-            except Exception as e:  # noqa: BLE001
-                log.error("поиск %r: %s", s["name"], e)
-                summary["errors"].append(f"search {s['name']}: {e}")
-        summary["fetched"] = len(collected)
+async def list_vacancies(
+    page: int,
+    page_size: int,
+    source: str | None = None,
+    status: str | None = None,
+    q: str | None = None,
+    remote: bool | None = None,
+    min_salary: int | None = None,
+) -> tuple[list, int]:
+    db = await get_db()
+    where: list[str] = []
+    params: list = []
 
-        # дедуп по hh_id (и внутри батча, и с БД)
-        seen: set[str] = set()
-        fresh: list[dict] = []
-        for v in collected:
-            if v["hh_id"] not in seen:
-                seen.add(v["hh_id"])
-                fresh.append(v)
-        new = [v for v in fresh if not await db.vacancy_exists(v["hh_id"])]
-        summary["new"] = len(new)
+    if source:
+        where.append("source = ?")
+        params.append(source)
+    if status:
+        where.append("status = ?")
+        params.append(status)
+    if q:
+        pattern = f"%{q}%"
+        where.append("(title LIKE ? OR company LIKE ? OR description LIKE ?)")
+        params.extend([pattern, pattern, pattern])
+    if remote is not None:
+        where.append("remote = ?")
+        params.append(1 if remote else 0)
+    if min_salary is not None:
+        where.append("(salary_from >= ? OR salary_to >= ?)")
+        params.extend([min_salary, min_salary])
 
-        # --- 2. детали (полное описание) + сохранение
-        sem = asyncio.Semaphore(3)
+    where_sql = f" WHERE {' AND '.join(where)}" if where else ""
 
-        async def save_one(v: dict) -> None:
-            async with sem:
-                detail = await fetch_details(v["hh_id"], session=session)
-                if detail and detail.get("description"):
-                    v["description"] = detail["description"]
-                await db.upsert_vacancy(v)
+    count_cursor = await db.execute(
+        f"SELECT COUNT(*) AS total FROM vacancies{where_sql}", params
+    )
+    count_row = await count_cursor.fetchone()
+    await count_cursor.close()
+    total = int(count_row["total"]) if count_row else 0
 
-        if new:
-            await asyncio.gather(*[save_one(v) for v in new])
-        await db.update_run(run_id, fetched=len(new), phase="done")
+    offset = (page - 1) * page_size
+    cursor = await db.execute(
+        f"""
+        SELECT * FROM vacancies{where_sql}
+        ORDER BY (published_at IS NULL) ASC, published_at DESC, first_seen DESC, id DESC
+        LIMIT ? OFFSET ?
+        """,
+        [*params, page_size, offset],
+    )
+    rows = await cursor.fetchall()
+    await cursor.close()
+    return rows, total
 
 
-# -------------------------------------------------------------------- app
+async def get_vacancy(vacancy_id: int):
+    db = await get_db()
+    cursor = await db.execute("SELECT * FROM vacancies WHERE id = ?", (vacancy_id,))
+    row = await cursor.fetchone()
+    await cursor.close()
+    return row
+
+
+async def set_status(vacancy_id: int, status: str):
+    async with _write_lock:
+        db = await get_db()
+        try:
+            cursor = await db.execute(
+                "UPDATE vacancies SET status = ? WHERE id = ?",
+                (status, vacancy_id),
+            )
+            await db.commit()
+            changed = cursor.rowcount
+            await cursor.close()
+        except Exception:
+            await db.rollback()
+            raise
+    if not changed:
+        return None
+    return await get_vacancy(vacancy_id)
+
+
+async def stats() -> dict:
+    db = await get_db()
+    by_source = {name: 0 for name in VALID_SOURCES}
+    by_status = {name: 0 for name in VALID_STATUS}
+
+    cursor = await db.execute(
+        "SELECT source, COUNT(*) AS cnt FROM vacancies GROUP BY source"
+    )
+    for row in await cursor.fetchall():
+        if row["source"] in by_source:
+            by_source[row["source"]] = int(row["cnt"])
+    await cursor.close()
+
+    cursor = await db.execute(
+        "SELECT status, COUNT(*) AS cnt FROM vacancies GROUP BY status"
+    )
+    for row in await cursor.fetchall():
+        if row["status"] in by_status:
+            by_status[row["status"]] = int(row["cnt"])
+    await cursor.close()
+
+    return {
+        "total": sum(by_source.values()),
+        "by_source": by_source,
+        "by_status": by_status,
+    }
+
+
+async def create_run(run_id: str) -> None:
+    async with _write_lock:
+        db = await get_db()
+        try:
+            await db.execute(
+                "INSERT INTO runs (id, started_at, phase) VALUES (?, ?, 'queued')",
+                (run_id, now_iso()),
+            )
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
+
+
+async def update_run(run_id: str, **fields) -> None:
+    invalid = set(fields) - RUN_FIELDS
+    if invalid:
+        raise ValueError(f"Недопустимые поля прогона: {', '.join(sorted(invalid))}")
+    if not fields:
+        return
+
+    assignments = ", ".join(f"{name} = ?" for name in fields)
+    values = [value for value in fields.values()]
+
+    async with _write_lock:
+        db = await get_db()
+        try:
+            await db.execute(
+                f"UPDATE runs SET {assignments} WHERE id = ?",
+                [*values, run_id],
+            )
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
+
+
+async def get_run(run_id: str):
+    db = await get_db()
+    cursor = await db.execute("SELECT * FROM runs WHERE id = ?", (run_id,))
+    row = await cursor.fetchone()
+    await cursor.close()
+    return row
+
+
+async def last_run():
+    db = await get_db()
+    cursor = await db.execute(
+        "SELECT * FROM runs ORDER BY started_at DESC, id DESC LIMIT 1"
+    )
+    row = await cursor.fetchone()
+    await cursor.close()
+    return row
+
+
+async def _run_scrape(run_id: str) -> None:
+    async def on_progress(phase: str, fetched: int, filtered: int) -> None:
+        await update_run(run_id, phase=phase, fetched=fetched, filtered=filtered)
+
+    try:
+        report = await scrape_all(on_progress)
+        await update_run(
+            run_id,
+            phase="save",
+            fetched=report.fetched,
+            filtered=report.filtered,
+            errors_json=json.dumps(report.errors, ensure_ascii=False),
+        )
+        saved = await upsert_vacancies(report.items)
+        await update_run(
+            run_id,
+            phase="done",
+            finished_at=now_iso(),
+            saved=saved,
+        )
+    except Exception as exc:
+        log.exception("Прогон сбора %s завершился ошибкой", run_id)
+        await update_run(
+            run_id,
+            phase="error",
+            finished_at=now_iso(),
+            error=str(exc)[:1000],
+        )
+
+
+class StatusUpdate(BaseModel):
+    status: str
+
+
+class VacancyOut(BaseModel):
+    id: int
+    source: Literal["hh", "habr", "remoteok"]
+    source_id: str
+    title: str
+    company: str
+    url: str
+    location: str | None = None
+    salary_from: int | None = None
+    salary_to: int | None = None
+    currency: str | None = None
+    salary_period: Literal["month", "year"] | None = None
+    published_at: str | None = None
+    description: str
+    tags: list[str] = Field(default_factory=list)
+    remote: bool
+    it_score: int
+    status: Literal["new", "liked", "rejected", "applied", "archived"]
+    first_seen: str
+    last_seen: str
+
+
+class PageOut(BaseModel):
+    items: list[VacancyOut]
+    page: int
+    page_size: int
+    total: int
+    pages: int
+
+
+class RunOut(BaseModel):
+    id: str
+    started_at: str
+    finished_at: str | None = None
+    phase: str
+    fetched: int
+    filtered: int
+    saved: int
+    errors_json: str
+    error: str | None = None
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await db.init_db()
-    if settings.scheduler_enabled:
-        async def scheduled():
-            # не запускаем, если уже идёт прогон
-            if _running["task"] is None or _running["task"].done():
-                rid = _new_run_id()
-                _running["run_id"] = rid
-                _running["task"] = asyncio.create_task(run_agent(rid))
-        scheduler = start_scheduler(scheduled)
-    else:
-        scheduler = None
+    await init_db()
     yield
-    if scheduler:
-        scheduler.shutdown(wait=False)
-    await db.close_db()
+    task = _run_task
+    if task is not None and not task.done():
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+    await close_db()
 
 
-app = FastAPI(title="AI Job Hunter", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="AI Job Hunter", version="2.0.0", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
 
 
 @app.get("/")
-async def index():
-    """Дашборд (templates/index.html)."""
+async def index() -> FileResponse:
     return FileResponse(BASE_DIR / "templates" / "index.html")
 
 
-@app.get("/api/health")
-async def health():
-    """Статус приложения + доступность Ollama."""
-    ollama = await check_ollama()
-    last = await db.last_run()
+@app.get("/api/vacancies", response_model=PageOut)
+async def api_vacancies(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    source: str | None = None,
+    status: str | None = None,
+    q: str | None = Query(None, max_length=200),
+    remote: bool | None = None,
+    min_salary: int | None = Query(None, ge=0),
+):
+    if source is not None and source not in VALID_SOURCES:
+        raise HTTPException(400, f"Недопустимый источник: {source}")
+    if status is not None and status not in VALID_STATUS:
+        raise HTTPException(400, f"Недопустимый статус: {status}")
+
+    rows, total = await list_vacancies(
+        page=page,
+        page_size=page_size,
+        source=source,
+        status=status,
+        q=q.strip() if q else None,
+        remote=remote,
+        min_salary=min_salary,
+    )
+    pages = (total + page_size - 1) // page_size if total else 0
     return {
-        "app": "ok",
-        "ollama_online": ollama["online"],
-        "ollama_configured": ollama.get("configured", False),
-        "ollama_models": ollama.get("models", []),
-        "model": settings.ollama_model,
-        "threshold": settings.score_threshold,
-        "last_run": dict(last) if last else None,
+        "items": [_serialize(row) for row in rows],
+        "page": page,
+        "page_size": page_size,
+        "total": total,
+        "pages": pages,
     }
 
 
-@app.get("/api/profile")
-async def api_profile():
-    """Активный профиль кандидата (для футера дашборда)."""
-    try:
-        p = load_profile()
-    except Exception as e:  # noqa: BLE001
-        raise HTTPException(500, str(e))
-    return {"profile": p, "hash": profile_hash(p), "threshold": settings.score_threshold}
+@app.get("/api/vacancies/{vacancy_id}", response_model=VacancyOut)
+async def api_vacancy(vacancy_id: int):
+    row = await get_vacancy(vacancy_id)
+    if row is None:
+        raise HTTPException(404, "vacancy не найдена")
+    return _serialize(row)
 
 
-@app.get("/api/vacancies")
-async def api_vacancies(status: str | None = None, min_score: int | None = None,
-                        q: str | None = None):
-    """Вакансии из БД (JSON) с фильтрами."""
-    rows = await db.list_vacancies(status=status, min_score=min_score, q=q)
-    return [serialize(v) for v in rows]
+@app.patch("/api/vacancies/{vacancy_id}", response_model=VacancyOut)
+async def api_set_status(vacancy_id: int, payload: StatusUpdate):
+    if payload.status not in VALID_STATUS:
+        raise HTTPException(400, f"Недопустимый статус: {payload.status}")
+    row = await set_status(vacancy_id, payload.status)
+    if row is None:
+        raise HTTPException(404, "vacancy не найдена")
+    return _serialize(row)
 
 
-@app.post("/api/run-agent")
-async def api_run_agent():
-    """Запускает СБОР вакансий в фоне и сразу возвращает run_id (UI не зависает).
+@app.post("/api/scrape")
+async def api_scrape():
+    global _run_task, _run_id
 
-    Только hh.ru + сохранение в БД — LLM в этом эндпоинте не вызывается
-    (письма генерируются по одной кнопкой /api/vacancies/{id}/generate-letter).
+    async with _scrape_lock:
+        if _run_task is not None and not _run_task.done():
+            return {"run_id": _run_id, "started": False}
 
-    ВАЖНО: run_id создаётся здесь ОДИН раз и пробрасывается в run_agent() —
-    именно его фронт потом опрашивает по GET /api/run/{run_id}.
-    """
-    task = _running["task"]
-    if task is not None and not task.done():
-        return {"run_id": _running["run_id"], "started": False,
-                "message": "сбор уже идёт"}
-    rid = _new_run_id()
-    _running["run_id"] = rid
-    _running["task"] = asyncio.create_task(run_agent(rid))
-    return {"run_id": rid, "started": True}
+        rid = uuid.uuid4().hex[:12]
+        await create_run(rid)
+        _run_id = rid
+        _run_task = asyncio.create_task(_run_scrape(rid))
+        return {"run_id": rid, "started": True}
 
 
-@app.get("/api/run/{run_id}")
+@app.get("/api/runs/{run_id}", response_model=RunOut)
 async def api_run(run_id: str):
-    """Статус прогона: phase, fetched, finished_at, error.
-    Опрашивается фронтом каждые 1,5 с, пока finished_at пуст."""
-    row = await db.get_run(run_id)
+    row = await get_run(run_id)
     if row is None:
         raise HTTPException(404, "run не найден")
     return dict(row)
 
 
-class StatusIn(BaseModel):
-    status: str
+@app.get("/api/stats")
+async def api_stats():
+    return await stats()
 
 
-@app.patch("/api/vacancies/{vacancy_id}")
-async def api_set_status(vacancy_id: int, body: StatusIn):
-    """Триаж: new / liked / rejected / applied / archived."""
-    if body.status not in VALID_STATUS:
-        raise HTTPException(400, f"status должен быть из {sorted(VALID_STATUS)}")
-    row = await db.set_status(vacancy_id, body.status)
-    if row is None:
-        raise HTTPException(404, "vacancy не найдена")
-    return serialize(row)
-
-
-@app.get("/api/vacancies/{vacancy_id}")
-async def api_vacancy_one(vacancy_id: int):
-    """Одна вакансия из БД."""
-    row = await db.get_vacancy(vacancy_id)
-    if row is None:
-        raise HTTPException(404, "vacancy не найдена")
-    return serialize(row)
-
-
-@app.post("/api/vacancies/{vacancy_id}/generate-letter")
-async def api_generate_letter(vacancy_id: int):
-    """Генерация письма по ОДНОЙ вакансии (по кнопке в карточке).
-
-    Берёт текст вакансии из БД -> ai_agent.generate_letter -> сохраняет в БД
-    -> возвращает текст письма. Одна генерация за раз не перегружает GPU.
-    """
-    row = await db.get_vacancy(vacancy_id)
-    if row is None:
-        raise HTTPException(404, "vacancy не найдена")
-    try:
-        profile = load_profile()
-    except Exception as e:  # noqa: BLE001
-        raise HTTPException(500, f"профиль: {e}")
-    await db.set_letter(vacancy_id, None, "pending")
-    letter, err = await generate_letter(profile, row)
-    if letter and err is None:
-        await db.set_letter(vacancy_id, letter, "ready")
-        return {"ok": True, "letter": letter, "letter_status": "ready"}
-    await db.set_letter(vacancy_id, None, "failed")
-    log.warning("письмо %s не удалось: %s", vacancy_id, err)
-    raise HTTPException(502, err or "LLM не вернула письмо (Ollama недоступна?)")
-
-
-def serialize(row) -> dict:
-    """Row → JSON-совместимый словарь (распаковываем *_json поля)."""
-
-    def _load(key: str):
-        raw = row[key]
-        if not raw:
-            return []
-        try:
-            return json.loads(raw)
-        except json.JSONDecodeError:
-            return []
-
-    d = dict(row)
-    d["matched"] = _load("matched_json")
-    d["missing"] = _load("missing_json")
-    d["red_flags"] = _load("red_flags_json")
-    for k in ("matched_json", "missing_json", "red_flags_json", "raw_json"):
-        d.pop(k, None)
-    return d
+@app.get("/api/health")
+async def api_health():
+    current = await stats()
+    row = await last_run()
+    return {
+        "status": "ok",
+        "total": current["total"],
+        "last_run": dict(row) if row is not None else None,
+    }
