@@ -13,7 +13,7 @@ import json
 import logging
 import re
 
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, BadRequestError
 
 from config import settings
 
@@ -21,6 +21,8 @@ log = logging.getLogger("ai")
 
 _client: AsyncOpenAI | None = None
 DESC_LIMIT = 4000  # сколько символов описания отправляем в LLM (экономия контекста)
+MAX_TOKENS = 2048  # generation limit: prevents JSON and letter truncation
+LLM_TIMEOUT = 120.0  # hard per-request ceiling so a hung LM Studio can't block the pipeline for 10 minutes
 
 
 def client() -> AsyncOpenAI:
@@ -30,7 +32,7 @@ def client() -> AsyncOpenAI:
         _client = AsyncOpenAI(
             base_url=settings.ollama_base_url,
             api_key=settings.ollama_api_key,
-            timeout=300.0,   # 27B-модель на CPU/локально может думать долго
+            timeout=LLM_TIMEOUT,  # bounded wait; a stuck local model fails fast instead of hanging
             max_retries=0,   # ретраи делаем сами, с ремонтом промпта
         )
     return _client
@@ -143,17 +145,29 @@ def _as_list(x) -> list[str]:
 async def _chat(messages: list[dict], temperature: float) -> str:
     """Один вызов chat.completions. JSON-режим опционален: старые Ollama/LM Studio
     могут не поддерживать response_format — тогда ретраим без него."""
-    kwargs = {"model": settings.ollama_model, "messages": messages, "temperature": temperature}
+    kwargs = {
+        "model": settings.ollama_model,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": MAX_TOKENS,
+    }
     try:
         resp = await client().chat.completions.create(
             response_format={"type": "json_object"}, **kwargs
         )
         return resp.choices[0].message.content or ""
-    except Exception as e:
-        if "response_format" in str(e).lower() or "json_object" in str(e).lower():
-            resp = await client().chat.completions.create(**kwargs)
-            return resp.choices[0].message.content or ""
-        raise
+    except BadRequestError as e:
+        # Server rejected the request with HTTP 400. Decide by status code (typed exception),
+        # not by substring search in message text (LM Studio returns a bare "Error code: 400").
+        # Retry once without response_format; if the retry also fails — the exception goes up.
+        body = getattr(e, "body", None)
+        log.warning(
+            "JSON mode rejected (HTTP %s); retrying without response_format; body: %s",
+            getattr(e, "status_code", 400),
+            str(body)[:200],
+        )
+        resp = await client().chat.completions.create(**kwargs)
+        return resp.choices[0].message.content or ""
 
 
 def _profile_block(profile: dict) -> str:
@@ -163,6 +177,23 @@ def _profile_block(profile: dict) -> str:
         return str(profile)
 
 
+def _render(template: str, **values: str) -> str:
+    """Substitutes {placeholders} in template and verifies there are no leftovers:
+    unsubstituted placeholders (e.g. {job_description}) silently go literally to LLM — the bug."""
+    out = template
+    for key, value in values.items():
+        out = out.replace("{" + key + "}", str(value))
+    leftover = sorted({m for m in re.findall(r"\{([A-Za-z_][A-Za-z0-9_]*)\}", out)})
+    if leftover:
+        log.error("prompt template: unsubstituted placeholders: %s", ", ".join(leftover))
+    return out
+
+
+def _safe_description(row) -> str:
+    """Нормализует описание: collapse whitespace; returns '' if missing/empty."""
+    return " ".join(str(row.get("description") or "").split())
+
+
 def _vacancy_block(row) -> str:
     salary_from = row.get("salary_from")
     salary_to = row.get("salary_to")
@@ -170,6 +201,7 @@ def _vacancy_block(row) -> str:
     salary_period = row.get("salary_period")
     if salary_period:
         salary = f"{salary} per {salary_period}".strip()
+    description = _safe_description(row)
     return json.dumps(
         {
             "title": row.get("title") or "",
@@ -179,7 +211,7 @@ def _vacancy_block(row) -> str:
             "salary_period": salary_period or "",
             "tags": row.get("tags") or [],
             "remote": bool(row.get("remote")),
-            "description": (row.get("description") or "")[:DESC_LIMIT],
+            "description": (description or "(нет описание — детали не loaded; оцен только на title/tags)")[:DESC_LIMIT],
         },
         ensure_ascii=False,
         indent=2,
@@ -187,8 +219,22 @@ def _vacancy_block(row) -> str:
 
 
 async def analyze_vacancy(profile: dict, row) -> dict:
-    """Оценивает вакансию (1-10 + matched/missing/red_flags). НЕ бросает исключения."""
-    system = SCORING_SYSTEM.replace("{profile}", _profile_block(profile))
+    """Score the vacancy (1-10 + matched/missing/red_flags). NEVER throws exceptions."""
+    if not _safe_description(row):
+        log.warning(
+            "vacancy %s: description empty — skip LLM scoring (retried when detail loads)",
+            row.get("id"),
+        )
+        return {
+            "score": None,
+            "verdict": None,
+            "matched": [],
+            "missing": [],
+            "red_flags": [],
+            "reason": "нет описание: cannot score (details not loaded or empty)",
+        }
+
+    system = _render(SCORING_SYSTEM, profile=_profile_block(profile))
     user = _vacancy_block(row)
     last_raw = ""
 
@@ -238,7 +284,9 @@ async def analyze_vacancy(profile: dict, row) -> dict:
 
 async def generate_letter(profile: dict, row) -> tuple[str | None, str | None]:
     """Генерирует сопроводительное письмо. Возвращает (letter, error). НЕ бросает."""
-    system = LETTER_SYSTEM.replace("{profile}", _profile_block(profile))
+    if not _safe_description(row):
+        return None, "empty description: cannot write a letter without content"
+    system = _render(LETTER_SYSTEM, profile=_profile_block(profile))
     user = _vacancy_block(row) + "\n\nНапиши сопроводительное письмо под ЭТУ вакансию."
     last_raw = ""
 

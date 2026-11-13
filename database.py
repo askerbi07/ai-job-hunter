@@ -8,6 +8,7 @@ import asyncio
 import json
 from uuid import uuid4
 from datetime import datetime, timezone
+from pathlib import Path
 
 import aiosqlite
 
@@ -62,7 +63,9 @@ CREATE TABLE IF NOT EXISTS vacancies (
     analyzed_at TEXT,
     profile_hash TEXT,
     cover_letter TEXT,
-    letter_status TEXT NOT NULL DEFAULT 'none'
+    letter_status TEXT NOT NULL DEFAULT 'none',
+    search_text TEXT NOT NULL DEFAULT '',
+    dealbreaker TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_vacancies_status ON vacancies (status);
@@ -106,6 +109,8 @@ _VACANCY_ADD_COLUMNS = {
     "profile_hash": "TEXT",
     "cover_letter": "TEXT",
     "letter_status": "TEXT",
+    "search_text": "TEXT",
+    "dealbreaker": "TEXT",
 }
 
 _VACANCY_NORMALIZE_DEFAULTS = {
@@ -144,6 +149,13 @@ _RUN_NORMALIZE_DEFAULTS = {
 
 _db: aiosqlite.Connection | None = None
 _db_lock = asyncio.Lock()
+_DB_PATH_OVERRIDE: str | None = None
+
+
+def set_db_path(path) -> None:
+    """Override the database path (used by tests). Pass None to reset."""
+    global _DB_PATH_OVERRIDE
+    _DB_PATH_OVERRIDE = str(path) if path else None
 
 
 def now_iso() -> str:
@@ -204,6 +216,36 @@ async def _normalize_vacancies(conn: aiosqlite.Connection) -> None:
     )
 
 
+def _search_text(*parts) -> str:
+    """Normalization for search: single spaces, lower casefold (case-insensitive for Cyrillic)."""
+    text = " ".join(str(part or "") for part in parts)
+    return " ".join(text.split()).casefold()
+
+
+async def _fill_search_text(conn: aiosqlite.Connection) -> None:
+    """Compute search_text for rows without it (SQLite LIKE is case-insensitive only for Latin)."""
+    cur = await conn.execute(
+        "SELECT id, title, company, location, description FROM vacancies "
+        "WHERE search_text IS NULL OR search_text = ''"
+    )
+    rows = await cur.fetchall()
+    await cur.close()
+    updates = [
+        {
+            "search_text": _search_text(
+                row["title"], row["company"], row["location"], row["description"]
+            ),
+            "id": row["id"],
+        }
+        for row in rows
+    ]
+    if updates:
+        await conn.executemany(
+            "UPDATE vacancies SET search_text = :search_text WHERE id = :id",
+            updates,
+        )
+
+
 async def _normalize_runs(conn: aiosqlite.Connection) -> None:
     for column, default in _RUN_NORMALIZE_DEFAULTS.items():
         await conn.execute(f"UPDATE runs SET {column} = COALESCE({column}, :{column})", {column: default})
@@ -211,6 +253,7 @@ async def _normalize_runs(conn: aiosqlite.Connection) -> None:
 
 async def _migrate(conn: aiosqlite.Connection) -> None:
     await _ensure_columns(conn, "vacancies", _VACANCY_ADD_COLUMNS)
+    await _fill_search_text(conn)
     await _normalize_vacancies(conn)
     await _ensure_columns(conn, "runs", _RUN_ADD_COLUMNS)
     await _normalize_runs(conn)
@@ -226,8 +269,9 @@ async def init_db() -> aiosqlite.Connection:
         if _db is not None:
             return _db
 
-        settings.db_path.parent.mkdir(parents=True, exist_ok=True)
-        conn = await aiosqlite.connect(str(settings.db_path))
+        db_path = Path(_DB_PATH_OVERRIDE) if _DB_PATH_OVERRIDE else settings.db_path
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        conn = await aiosqlite.connect(str(db_path))
         try:
             conn.row_factory = aiosqlite.Row
             await conn.execute("PRAGMA journal_mode=WAL")
@@ -315,7 +359,7 @@ def _row_to_dict(row) -> dict:
     letter_status = _ensure_text(data.get("letter_status"), "none")
     data["letter_status"] = letter_status if letter_status in {"none", "ready", "failed"} else "none"
 
-    for key in ("tags_json", "matched_json", "missing_json", "red_flags_json", "raw_json"):
+    for key in ("tags_json", "matched_json", "missing_json", "red_flags_json", "raw_json", "search_text", "dealbreaker"):
         data.pop(key, None)
 
     data["tags"] = _parse_json_list(row["tags_json"] if hasattr(row, "keys") and "tags_json" in row.keys() else data.get("tags"))
@@ -356,9 +400,15 @@ async def list_vacancies(
         params["status"] = status
 
     if q:
-        like = _sql_like_term(q)
-        where.append("(title LIKE :q OR description LIKE :q OR location LIKE :q)")
-        params["q"] = like
+        like = _sql_like_term(q.casefold())
+        # Vibe-coding вакансии всегда попадают в результаты поиска,
+        # даже если сам запрос их не упоминает (USP профиля).
+        vibe_terms = ("%vibe coding%", "%vibe-coding%", "%вайб-кодинг%", "%вайб кодинг%")
+        ors = " OR ".join(f"search_text LIKE :q{i}" for i in range(1, len(vibe_terms) + 1))
+        where.append(f"(search_text LIKE :q0 OR {ors})")
+        params["q0"] = like
+        for i, term in enumerate(vibe_terms, start=1):
+            params[f"q{i}"] = term
 
     if remote is not None:
         where.append("remote = :remote")
@@ -493,7 +543,8 @@ async def upsert_vacancies(items: list[dict]) -> int:
                     status = :status,
                     first_seen = :first_seen,
                     last_seen = :last_seen,
-                    raw_json = :raw_json
+                    raw_json = :raw_json,
+                    search_text = :search_text
                 WHERE source = :source AND source_id = :source_id
                 """,
                 {
@@ -514,6 +565,12 @@ async def upsert_vacancies(items: list[dict]) -> int:
                     "first_seen": first_seen,
                     "last_seen": last_seen,
                     "raw_json": raw_json,
+                    "search_text": _search_text(
+                        _ensure_text(item.get("title"), ""),
+                        company,
+                        _ensure_text(item.get("location"), ""),
+                        description,
+                    ),
                     "source": source,
                     "source_id": source_id,
                 },
@@ -525,11 +582,11 @@ async def upsert_vacancies(items: list[dict]) -> int:
                 INSERT INTO vacancies (
                     source, source_id, title, company, url, location, salary_from, salary_to,
                     currency, salary_period, published_at, description, tags_json, remote,
-                    it_score, status, first_seen, last_seen, raw_json
+                    it_score, status, first_seen, last_seen, raw_json, search_text
                 ) VALUES (
                     :source, :source_id, :title, :company, :url, :location, :salary_from, :salary_to,
                     :currency, :salary_period, :published_at, :description, :tags_json, :remote,
-                    :it_score, :status, :first_seen, :last_seen, :raw_json
+                    :it_score, :status, :first_seen, :last_seen, :raw_json, :search_text
                 )
                 """,
                 {
@@ -552,6 +609,12 @@ async def upsert_vacancies(items: list[dict]) -> int:
                     "first_seen": now,
                     "last_seen": now,
                     "raw_json": raw_json,
+                    "search_text": _search_text(
+                        _ensure_text(item.get("title"), ""),
+                        _ensure_text(item.get("company"), ""),
+                        item.get("location"),
+                        _ensure_text(item.get("description"), ""),
+                    ),
                 },
             )
         saved += 1
@@ -654,6 +717,7 @@ async def score_pending(profile_hash: str | None, limit: int) -> list[dict]:
     where = [
         "status != 'archived'",
         "(ai_score IS NULL OR profile_hash IS NULL OR profile_hash != :profile_hash)",
+        "(dealbreaker IS NULL OR profile_hash IS NULL OR profile_hash != :profile_hash)",
     ]
     sql = (
         "SELECT * FROM vacancies WHERE "
@@ -683,6 +747,16 @@ async def pending_letters(profile_hash: str | None, threshold: int, limit: int) 
     rows = [_row_to_dict(row) for row in await cur.fetchall()]
     await cur.close()
     return rows
+
+
+async def mark_dealbreaker(vacancy_id: int | str, word: str, profile_hash: str | None) -> None:
+    """Mark vacancy as skipped by dealbreaker (not sent to LLM; remember profile hash)."""
+    db = await get_db()
+    await db.execute(
+        "UPDATE vacancies SET dealbreaker = :dealbreaker, profile_hash = :profile_hash WHERE id = :id",
+        {"dealbreaker": word, "profile_hash": profile_hash, "id": int(vacancy_id)},
+    )
+    await db.commit()
 
 
 async def save_analysis(vacancy_id: int | str, analysis: dict, profile_hash: str | None) -> bool:
@@ -770,3 +844,69 @@ async def stats() -> dict:
         "scored": scored,
         "letters_ready": letters_ready,
     }
+
+
+async def _vacuum(db: aiosqlite.Connection) -> None:
+    """Reclaim disk space after bulk deletes (raw_json stores full HTML pages)."""
+    await db.execute("VACUUM")
+
+
+async def purge_old_vacancies(max_age_days: int) -> dict:
+    """Retention policy: drop non-liked/non-applied vacancies older than max_age_days.
+
+    Keeps everything the user cares about (liked/applied); frees the rest so the DB
+    does not grow without bound between runs.
+    """
+    from datetime import timedelta
+
+    days = max(1, int(max_age_days or 0))
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    db = await get_db()
+    cur = await db.execute(
+        "DELETE FROM vacancies WHERE status NOT IN ('liked', 'applied') "
+        "AND COALESCE(published_at, first_seen) < :cutoff",
+        {"cutoff": cutoff},
+    )
+    deleted = getattr(cur, "rowcount", 0) or 0
+    await db.commit()
+    await _vacuum(db)
+    return {"deleted_vacancies": int(deleted), "max_age_days": days}
+
+
+async def clear_cache(max_age_days: int = 30) -> dict:
+    """Manual cache wipe (UI button): remove all collected-but-unprocessed vacancies.
+
+    Deletes rows with status new/rejected/archived and keeps liked/applied, then
+    drops run history older than max_age_days and compacts the database file so
+    freed space is actually returned to disk.
+    """
+    from datetime import timedelta
+
+    days = max(1, int(max_age_days or 0))
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    db = await get_db()
+    cur = await db.execute(
+        "DELETE FROM vacancies WHERE status IN ('new', 'rejected', 'archived')"
+    )
+    deleted_vacancies = getattr(cur, "rowcount", 0) or 0
+    cur = await db.execute("DELETE FROM runs WHERE started_at < :cutoff", {"cutoff": cutoff})
+    deleted_runs = getattr(cur, "rowcount", 0) or 0
+    await db.commit()
+    await _vacuum(db)
+    return {
+        "deleted_vacancies": int(deleted_vacancies),
+        "deleted_runs": int(deleted_runs),
+        "max_age_days": days,
+    }
+
+
+async def get_dealbreaker(vacancy_id: int) -> tuple[str, str] | None:
+    """Return (word, profile_hash) of a dealbreaker mark for this vacancy, else None."""
+    db = await get_db()
+    cur = await db.execute(
+        "SELECT dealbreaker, profile_hash FROM vacancies WHERE id=?", (vacancy_id,)
+    )
+    row = await cur.fetchone()
+    if row is None or not row["dealbreaker"]:
+        return None
+    return row["dealbreaker"], row["profile_hash"]

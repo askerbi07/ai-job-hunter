@@ -6,7 +6,6 @@ import logging
 import time
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
-from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse
@@ -15,17 +14,21 @@ from pydantic import BaseModel, Field
 
 from config import settings, load_profile, profile_hash
 from database import (
+    clear_cache,
     close_db,
     complete_known_keys,
     create_run,
     get_vacancy,
+    get_dealbreaker,
     init_db,
     last_run,
     get_run,
     list_vacancies,
     now_iso,
     pending_letters,
+    purge_old_vacancies,
     save_analysis,
+    mark_dealbreaker,
     score_pending,
     set_letter,
     set_status,
@@ -39,10 +42,24 @@ from ai_agent import analyze_vacancy, check_ollama, generate_letter
 
 BASE_DIR = Path(__file__).resolve().parent
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-)
+def _configure_logging() -> None:
+    """Console + file log logs/app.log (UTF-8): no PowerShell redirection needed."""
+    handlers: list[logging.Handler] = [logging.StreamHandler()]
+    try:
+        (BASE_DIR / "logs").mkdir(parents=True, exist_ok=True)
+        handlers.append(
+            logging.FileHandler(BASE_DIR / "logs" / "app.log", encoding="utf-8")
+        )
+    except OSError:
+        pass  # read-only fs: console only
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        handlers=handlers,
+    )
+
+
+_configure_logging()
 log = logging.getLogger("app")
 
 _ai_health_cache: dict | None = None
@@ -103,16 +120,49 @@ async def _ai_health() -> dict:
     else:
         ai_status = "no profile"
 
+    # Explicitly surface a missing profile.yaml so the UI can warn instead of
+    # silently scoring on default keywords.
+    profile_file = BASE_DIR / "profile.yaml"
+    profile_loaded = profile_file.exists()
     result = {
         "ai_status": ai_status,
         "ai_ready": ready,
         "ai_model": settings.ollama_model,
         "ai_error": check.get("error") if not online else None,
+        "profile_loaded": profile_loaded,
+        "profile_error": None
+        if profile_loaded
+        else "profile.yaml not found — scoring runs on default keywords",
     }
 
     _ai_health_ts = now
     _ai_health_cache = result
     return result
+
+
+def _dealbreaker_words(profile: dict) -> list[str]:
+    raw = profile.get("dealbreakers") or []
+    if isinstance(raw, str):
+        raw = [raw]
+    words: list[str] = []
+    for item in raw:
+        word = " ".join(str(item).split()).casefold()
+        if word:
+            words.append(word)
+    return words
+
+
+def _dealbreaker_hit(row: dict, words: list[str]) -> str | None:
+    if not words:
+        return None
+    haystack = " ".join(
+        " ".join(str(row.get(key) or "").split()).casefold()
+        for key in ("title", "description")
+    )
+    for word in words:
+        if word in haystack:
+            return word
+    return None
 
 
 async def _ai_pipeline(run_id: str) -> tuple[int, int]:
@@ -126,8 +176,13 @@ async def _ai_pipeline(run_id: str) -> tuple[int, int]:
 
     await update_run(run_id, phase="score")
     analyzed = 0
+    breaker_words = _dealbreaker_words(profile)
 
     for vac in await score_pending(current_hash, settings.max_score_per_run):
+        hit = _dealbreaker_hit(vac, breaker_words)
+        if hit:
+            await mark_dealbreaker(vac["id"], hit, current_hash)
+            continue
         try:
             analysis = await analyze_vacancy(profile, vac)
         except Exception as exc:
@@ -171,18 +226,9 @@ async def _run_pipeline(run_id: str) -> None:
         known_count = len(known)
         errors = getattr(report, "errors", {}) or {}
 
-        await update_run(
-            run_id,
-            phase="score",
-            fetched=report.fetched,
-            filtered=report.filtered,
-            saved=saved,
-            known=known_count,
-            errors_json=errors,
-        )
-
-        analyzed, letters = await _ai_pipeline(run_id)
-
+        # Scraper-only mode: the pipeline stops right after saving vacancies to SQLite.
+        # No automatic LLM scoring or letter generation here — an external agent (Hermes)
+        # reads the DB and analyzes vacancies on demand via the manual endpoints.
         await update_run(
             run_id,
             phase="done",
@@ -191,9 +237,22 @@ async def _run_pipeline(run_id: str) -> None:
             filtered=report.filtered,
             saved=saved,
             known=known_count,
-            analyzed=analyzed,
-            letters=letters,
+            errors_json=errors,
+            analyzed=0,
+            letters=0,
         )
+
+        # Retention: drop stale non-liked vacancies so the DB does not grow forever.
+        try:
+            purged = await purge_old_vacancies(settings.cache_retention_days)
+            if purged.get("deleted_vacancies"):
+                log.info(
+                    "Retention removed %d old vacancy rows (max_age=%dd)",
+                    purged["deleted_vacancies"],
+                    settings.cache_retention_days,
+                )
+        except Exception:
+            log.exception("Post-run retention purge failed", exc_info=True)
     except Exception as exc:
         log.exception("Run %s failed", run_id, exc_info=True)
         await update_run(
@@ -382,10 +441,57 @@ async def api_set_status(vacancy_id: int, payload: StatusUpdate):
     return row
 
 
+@app.post("/api/vacancies/{vacancy_id}/letter", response_model=VacancyOut)
+async def api_generate_letter(vacancy_id: int):
+    """Generate cover letter on demand: no ai_score threshold check."""
+    row = await get_vacancy(vacancy_id)
+    if row is None:
+        raise HTTPException(404, "vacancy not found")
+
+    health = await _ai_health()
+    if not health["ai_ready"]:
+        raise HTTPException(503, f"AI not ready: {health['ai_status']}")
+
+    profile, _profile_hash = await _get_profile_cached(force=True)
+    if profile is None:
+        raise HTTPException(500, "profile not loaded")
+
+    # Respect dealbreakers even on manual generation: don't write a letter for a job
+    # the current profile already rejected.
+    mark = await get_dealbreaker(vacancy_id)
+    if mark is not None and mark[1] == _profile_hash:
+        raise HTTPException(409, f"dealbreaker for your profile ({mark[0]}); letter skipped")
+
+    letter, error = await generate_letter(profile, row)
+    if letter and not error:
+        await set_letter(vacancy_id, letter, "ready")
+    else:
+        await set_letter(vacancy_id, None, "failed")
+        raise HTTPException(502, (error or "letter generation failed")[:300])
+
+    updated = await get_vacancy(vacancy_id)
+    if updated is None:
+        raise HTTPException(500, "vacancy not found after write")
+    return updated
+
+
+@app.post("/vacancies/{vacancy_id}/letter", response_model=VacancyOut)
+async def api_generate_letter_alias(vacancy_id: int):
+    return await api_generate_letter(vacancy_id)
+
+
 @app.post("/api/scrape")
 async def api_scrape():
     run_id, started = await _start_run_task()
     return {"run_id": run_id, "started": started}
+
+
+@app.post("/api/cache/clear")
+async def api_clear_cache():
+    """Manual cache wipe: drop collected-but-unprocessed vacancies (keep liked/applied)."""
+    result = await clear_cache()
+    log.info("Cache cleared by user: %s", result)
+    return {"ok": True, **result}
 
 
 @app.get("/api/runs/{run_id}", response_model=RunOut)
@@ -418,4 +524,7 @@ async def api_health():
         "ai_ready": ai["ai_ready"],
         "ai_model": ai["ai_model"],
         "ai_error": ai["ai_error"],
+        "profile_loaded": ai.get("profile_loaded", True),
+        "profile_error": ai.get("profile_error"),
     }
+

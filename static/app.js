@@ -19,6 +19,8 @@ const state = {
   stats: null,
 };
 
+const generating = new Set();
+
 const SOURCE_META = {
   hh: { label: "hh.ru", cls: "border-red-500/40 bg-red-500/10 text-red-300" },
   habr: { label: "Habr Career", cls: "border-sky-500/40 bg-sky-500/10 text-sky-300" },
@@ -320,6 +322,17 @@ function ensureLayout() {
     (header || main).append(button);
   }
 
+  if (!scrapeButton() || !$("#clear-cache-btn")) {
+    const clearBtn = el(
+      "button",
+      "rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm font-medium text-slate-700 transition-colors hover:bg-slate-50 active:bg-slate-100 ml-2",
+      "Очистить кэш"
+    );
+    clearBtn.id = "clear-cache-btn";
+    clearBtn.type = "button";
+    (header || main).append(clearBtn);
+  }
+
   let footer = $("footer");
   if (!footer) {
     footer = el("footer", "mx-auto max-w-5xl px-4 pb-8 text-xs text-slate-600");
@@ -558,6 +571,15 @@ function card(v) {
     );
   }
 
+  if (v.cover_letter) {
+    const panel = el(
+      "div",
+      "letter-panel mt-3 rounded-xl border border-indigo-500/30 bg-slate-900/70 px-4 py-3 text-sm leading-relaxed text-slate-200",
+      v.cover_letter
+    );
+    article.append(panel);
+  }
+
   const actions = el("div", "mt-3 flex flex-wrap items-center gap-2");
   const buttons = [
     ["liked", "Лайк"],
@@ -589,6 +611,27 @@ function card(v) {
   open.target = "_blank";
   open.rel = "noopener noreferrer";
   actions.append(open);
+
+  if (v.cover_letter) {
+    const copy = el(
+      "button",
+      "rounded-lg border border-indigo-500/40 px-2.5 py-1 text-xs text-indigo-200 transition-colors hover:bg-indigo-500/30",
+      "Copy letter"
+    );
+    copy.type = "button";
+    copy.addEventListener("click", () => copyLetter(v));
+    actions.append(copy);
+  }
+
+  const gen = el(
+    "button",
+    "rounded-lg border border-indigo-700 px-2.5 py-1 text-xs text-indigo-300 transition-colors hover:bg-indigo-500/30",
+    v.letter_status === "ready" ? "Regenerate letter" : "Write letter"
+  );
+  gen.type = "button";
+  gen.addEventListener("click", () => generateLetter(v.id));
+  actions.append(gen);
+
   article.append(actions);
 
   return article;
@@ -814,6 +857,41 @@ async function setStatus(id, status) {
   }
 }
 
+function copyLetter(v) {
+  navigator.clipboard
+    .writeText(v.cover_letter)
+    .then(() => toast("Letter copied to clipboard", "ok"))
+    .catch(() => toast("Failed to copy: select and copy manually", "err"));
+}
+
+async function generateLetter(id) {
+  if (generating.has(id)) {
+    toast("Already generating for this vacancy", "info");
+    return;
+  }
+  generating.add(id);
+  try {
+    const updated = await api(`/api/vacancies/${id}/letter`, { method: "POST" });
+    const index = state.items.findIndex((item) => item.id === id);
+    if (index >= 0) state.items[index] = updated;
+    replaceCard(id, updated);
+    toast("Letter generated", "ok");
+  } catch (error) {
+    toast(`Letter: ${error.message}`, "err");
+  } finally {
+    generating.delete(id);
+  }
+}
+
+function replaceCard(id, updated) {
+  for (const node of document.querySelectorAll("#cards article")) {
+    if (node.dataset.id === String(id)) {
+      node.replaceWith(card(updated));
+      return;
+    }
+  }
+}
+
 function goToPage(page) {
   if (page < 1 || (state.pages && page > state.pages)) return;
   state.page = page;
@@ -906,6 +984,24 @@ async function startScrape() {
     restoreScrapeButton();
     showProgress(false);
     toast(error.message, "err");
+  }
+}
+
+async function clearCache() {
+  const button = document.getElementById("clear-cache-btn");
+  if (!button || button.disabled) return;
+  button.disabled = true;
+  button.textContent = "Очистка…";
+  try {
+    const result = await api("/api/cache/clear", { method: "POST" });
+    alert(
+      `Кэш очищен: удалено вакансий — ${result.deleted_vacancies}, запусков — ${result.deleted_runs}`
+    );
+    location.reload();
+  } catch (error) {
+    alert(error.message || "Не удалось очистить кэш");
+    button.disabled = false;
+    button.textContent = "Очистить кэш";
   }
 }
 
@@ -1034,6 +1130,9 @@ function init() {
 
   const button = scrapeButton();
   if (button) button.addEventListener("click", startScrape);
+
+  const clearBtn = $("#clear-cache-btn");
+  if (clearBtn) clearBtn.addEventListener("click", clearCache);
 
   const prev = $("#pg-prev");
   if (prev) {

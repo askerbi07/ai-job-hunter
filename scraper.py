@@ -48,14 +48,16 @@ DETAIL_CONCURRENCY = _env_int("DETAIL_CONCURRENCY", 4, 1)
 HH_MAX_PAGES = _env_int("HH_MAX_PAGES", 3, 1)
 HABR_MAX_PAGES = _env_int("HABR_MAX_PAGES", 3, 1)
 REMOTEOK_LIMIT = _env_int("REMOTEOK_LIMIT", 300, 0)
+VIBE_CODING_QUERY = os.getenv("VIBE_CODING_QUERY", "vibe coding")
+VIBE_MAX_PAGES = _env_int("VIBE_MAX_PAGES", 2, 1)
 
-HH_QUERY = os.getenv("HH_QUERY", '(Python OR Backend OR Frontend OR DevOps OR Data OR ML OR QA)')
+HH_QUERY = os.getenv("HH_QUERY", '(Python OR Backend OR Frontend OR DevOps OR Data OR ML OR QA OR "Vibe Coding")')
 HH_AREA = os.getenv("HH_AREA", "113")
 HH_EXPERIENCE = os.getenv("HH_EXPERIENCE", "").strip()
 SCRAPE_QUERIES = [
     item.strip()
     for item in os.getenv(
-        "SCRAPE_QUERIES", "python,backend,frontend,devops,data,ml"
+        "SCRAPE_QUERIES", "python,backend,frontend,devops,data,ml,vibe coding"
     ).split(",")
     if item.strip()
 ][:8]
@@ -295,6 +297,10 @@ IT_TOKENS = (
     "системный администратор", "сисадмин", "информационная безопасность",
     "пентестер", "1с", "битрикс", "архитектор по", "tech lead", "team lead",
     "api", "rest", "graphql", "микросервисы",
+    # Vibe coding / AI-assisted development (user wants these in search results)
+    "vibe coding", "vibe-coding", "ai-assisted development",
+    "ai assisted development", "ai-ассистированная разработка",
+    "ai ассистент", "ai-ассистент", "копиласт",
 )
 
 NON_IT_BODY_PHRASES = (
@@ -446,6 +452,46 @@ def _dedupe(items: list[dict]) -> list[dict]:
     return [by_key[key] for key in order]
 
 
+def _cross_source_dedupe(items: list[dict]) -> list[dict]:
+    """Drop the same vacancy that shows up on more than one source (hh + habr, ...).
+
+    Fingerprint is normalized title + company. We only merge when we are confident it is
+    the identical posting — a salary conflict means two distinct roles and both are kept.
+    Keeps the richest copy (longest description, then higher it_score).
+    """
+    best: dict[str, dict] = {}
+    order: list[str] = []
+    for item in items:
+        title = _norm(item.get("title") or "")
+        company = _norm(item.get("company") or "")
+        if not title or not company:
+            continue
+        fp = f"{title} | {company}"
+        cur = best.get(fp)
+        if cur is None:
+            best[fp] = item
+            order.append(fp)
+            continue
+
+        a_from, a_to = cur.get("salary_from"), cur.get("salary_to")
+        b_from, b_to = item.get("salary_from"), item.get("salary_to")
+        salary_conflict = (a_from is not None and b_from is not None and a_from != b_from) or (
+            a_to is not None and b_to is not None and a_to != b_to
+        )
+        if salary_conflict:
+            # Different pay => likely distinct roles; keep this one as its own entry.
+            fp = f"{fp}#{item.get('source')}-{item.get('source_id')}"
+            best[fp] = item
+            order.append(fp)
+            continue
+
+        new_len = len(item.get("description") or "")
+        cur_len = len(cur.get("description") or "")
+        if new_len > cur_len or (new_len == cur_len and item.get("it_score", 0) > cur.get("it_score", 0)):
+            best[fp] = item
+    return [best[key] for key in order]
+
+
 # --------------------------------------------------------------------- hh
 
 
@@ -465,25 +511,59 @@ def _num(value: str) -> int | None:
     return int(digits) if digits else None
 
 
-def _hh_salary(block: str) -> tuple[int | None, int | None]:
+_RUB = r"(?:₽|руб\.?|рубл\w*)"
+
+
+def _hh_salary(block: str) -> tuple[int | None, int | None, str]:
+    """Return (salary_from, salary_to, period). Period is 'month' or 'year'.
+
+    Handles the common hh formats that the old regex missed:
+      * «150–200 тыс. руб./мес» and «от 80 до 120 тыс.» (thousands after numbers)
+      * currency words рублей/рубля, not just ₽ / руб.
+    """
     text = html_to_text(block, 10_000)
+    low = re.sub(r"\s+", " ", (text or "").lower().replace("\u00a0", " "))
+    period = "year" if re.search(r"(в\s+год|/год\b|yearly|annual)", low) else "month"
 
-    match = re.search(r"(\d[\d ]{2,12})\s*[–-]\s*(\d[\d ]{2,12})\s*₽", text)
-    if match:
-        return _num(match.group(1)), _num(match.group(2))
+    # Thousands stated after the numbers: «N–M тыс.» / «от N до M тыс.» / «до N тыс.».
+    m = re.search(r"(\d[\d ]{2,12})\s*[–-]\s*(\d[\d ]{2,12})\s*тыс\.?", low)
+    if m:
+        return (_num(m.group(1)) or 0) * 1000, (_num(m.group(2)) or 0) * 1000, period
+    m = re.search(r"от\s+(\d[\d ]{2,12})(?:\s+до\s+(\d[\d ]{2,12}))?\s*тыс\.?", low)
+    if m:
+        return (
+            (_num(m.group(1)) or 0) * 1000,
+            ((_num(m.group(2)) or 0) * 1000 if m.group(2) else None),
+            period,
+        )
+    m = re.search(r"до\s+(\d[\d ]{2,12})\s*тыс\.?", low)
+    if m:
+        return None, (_num(m.group(1)) or 0) * 1000, period
 
-    match = re.search(r"от\s*(\d[\d ]{2,12})(?:\s*до\s*(\d[\d ]{2,12}))?\s*₽", text, re.I)
+    # Currency-marked amounts (₽ / руб. / рублей ...).
+    match = re.search(r"(\d[\d ]{2,12})\s*[–-]\s*(\d[\d ]{2,12})\s*" + _RUB, low)
     if match:
-        return _num(match.group(1)), _num(match.group(2)) if match.group(2) else None
+        return _num(match.group(1)), _num(match.group(2)), period
+    match = re.search(r"от\s+(\d[\d ]{2,12})(?:\s*до\s*(\d[\d ]{2,12}))?\s*" + _RUB, low)
+    if match:
+        return (
+            _num(match.group(1)),
+            (_num(match.group(2)) if match.group(2) else None),
+            period,
+        )
+    match = re.search(r"до\s+(\d[\d ]{2,12})\s*" + _RUB, low)
+    if match:
+        return None, _num(match.group(1)), period
+    match = re.search(r"(\d[\d ]{2,12})\s*" + _RUB, low)
+    if match:
+        return _num(match.group(1)), None, period
+    return None, None, "month"
 
-    match = re.search(r"до\s*(\d[\d ]{2,12})\s*₽", text, re.I)
-    if match:
-        return None, _num(match.group(1))
 
-    match = re.search(r"(\d[\d ]{2,12})\s*₽", text)
-    if match:
-        return _num(match.group(1)), None
-    return None, None
+def _hh_remote(area: str | None) -> bool:
+    """Remote detection for hh: the address field says «удалённая работа» or similar."""
+    low = (area or "").lower()
+    return any(marker in low for marker in ("удал", "remote"))
 
 
 def _parse_hh_search(html_text: str) -> list[dict]:
@@ -502,7 +582,7 @@ def _parse_hh_search(html_text: str) -> list[dict]:
             continue
         company = _hh_field(block, "vacancy-serp__vacancy-employer-text")
         area = _hh_field(block, "vacancy-serp__vacancy-address")
-        salary_from, salary_to = _hh_salary(block)
+        salary_from, salary_to, salary_period = _hh_salary(block)
         out.append(
             {
                 "source": "hh",
@@ -513,11 +593,11 @@ def _parse_hh_search(html_text: str) -> list[dict]:
                 "salary_from": salary_from,
                 "salary_to": salary_to,
                 "currency": "RUB" if (salary_from or salary_to) else None,
-                "salary_period": "month",
+                "salary_period": salary_period,
                 "published_at": None,
                 "description": "",
                 "tags": [],
-                "remote": "удал" in (area or "").lower(),
+                "remote": _hh_remote(area),
                 "raw": {"search_block": block[:2000]},
             }
         )
@@ -531,19 +611,25 @@ def _extract_hh_description(text: str) -> str:
     start = match.end()
     depth = 1
     pos = start
+    end = len(text)
+    # \b after "div" so we never match <divider>/<dialog>; case-insensitive close.
+    open_re = re.compile(r"<div\b[^>]*>", re.I)
+    close_re = re.compile(r"</div\s*>", re.I)
     while pos < len(text) and depth:
-        next_open = text.find("<div", pos)
-        next_close = text.find("</div>", pos)
-        if next_close == -1:
+        next_open = open_re.search(text, pos)
+        next_close = close_re.search(text, pos)
+        if not next_close:
             break
-        if next_open != -1 and next_open < next_close:
+        if next_open is not None and next_open.start() < next_close.start():
             depth += 1
-            pos = next_open + 4
+            pos = next_open.end()
         else:
             depth -= 1
-            pos = next_close + 6
-    fragment = text[start : pos - 6 if pos > start else start]
-    return html_to_text(fragment, 20_000)
+            if depth == 0:
+                end = next_close.start()
+                break
+            pos = next_close.end()
+    return html_to_text(text[start:end], 20_000)
 
 
 def _hh_published(text: str) -> str | None:
@@ -656,7 +742,7 @@ async def scrape_hh(
             salary_from=item.get("salary_from"),
             salary_to=item.get("salary_to"),
             currency=item.get("currency"),
-            salary_period="month",
+            salary_period=item.get("salary_period") or "month",
             published_at=detail.get("published_at") or item.get("published_at"),
             description=description,
             tags=tags,
@@ -664,6 +750,60 @@ async def scrape_hh(
             it_score=score,
             raw={**item.get("raw", {}), "detail": detail},
         )
+
+    built = await asyncio.gather(*(process(item) for item in raw))
+    result.items = _dedupe([item for item in built if item])
+    return result
+
+
+# ------------------------------------------------------------------- hh vibe coding
+
+
+async def scrape_hh_vibe_coding(session, profile: Profile) -> SourceResult:
+    """Extra HH pass with a fixed 'vibe coding' query.
+
+    Runs alongside the keyword-driven HH search so that AI-assisted /
+    vibe-coding roles are always in the candidate pool regardless of what
+    the profile keywords happen to match.  Uses the same HTML endpoint and
+    parsing as scrape_hh; only the query text differs.
+    """
+    result = SourceResult(source="hh")
+    if not session:
+        return result
+
+    async def process(item: dict) -> dict | None:
+        return await _build_hh_vacancy(session, item, profile)
+
+    raw: list[dict] = []
+    for page in range(1, VIBE_MAX_PAGES + 1):
+        try:
+            resp = await session.get(
+                f"{HH}/search/vacancy",
+                params={
+                    "text": VIBE_CODING_QUERY,
+                    "area": profile.location_id or "",
+                    "page": page,
+                    "resultsPerPage": HH_PAGE_SIZE,
+                },
+                headers={"Accept": "text/html"},
+            )
+        except Exception as exc:  # noqa: BLE001 - network errors are expected
+            log.warning("HH vibe-coding search failed on page %d: %s", page, exc)
+            break
+        if resp.status_code != 200:
+            log.warning(
+                "HH vibe-coding search returned HTTP %d on page %d",
+                resp.status_code,
+                page,
+            )
+            break
+
+        items = _parse_hh_search(resp.text)
+        result.fetched += len(items)
+        raw.extend(items)
+        if not items:
+            break
+        await asyncio.sleep(profile.request_delay)
 
     built = await asyncio.gather(*(process(item) for item in raw))
     result.items = _dedupe([item for item in built if item])
@@ -973,6 +1113,7 @@ async def scrape_all(
         ("hh", scrape_hh),
         ("habr", scrape_habr),
         ("remoteok", scrape_remoteok),
+        ("hh_vibe", scrape_hh_vibe_coding),
     )
     try:
         for name, func in sources:
@@ -1004,6 +1145,7 @@ async def scrape_all(
         await session.close()
 
     report.items = _dedupe(report.items)
+    report.items = _cross_source_dedupe(report.items)
     report.filtered = len(report.items)
     return report
 
@@ -1018,4 +1160,5 @@ __all__ = [
     "scrape_hh",
     "scrape_habr",
     "scrape_remoteok",
+    "VIBE_CODING_QUERY",
 ]

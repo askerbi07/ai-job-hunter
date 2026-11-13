@@ -3,6 +3,7 @@ import logging
 from datetime import datetime
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronExpressionTrigger
 
 from config import settings
 
@@ -19,20 +20,23 @@ def _local_tz():
 
 
 def start_scheduler(job) -> AsyncIOScheduler:
-    """Запускает планировщик с ежедневным заданием (минута, час из RUN_CRON)."""
-    minute, hour = settings.run_cron
+    """Starts scheduler with daily job (full cron expression from RUN_CRON)."""
+    expr = settings.run_cron
+    try:
+        trigger = CronExpressionTrigger.from_cron(expr)
+    except (TypeError, ValueError):
+        log.warning("unsupported RUN_CRON: %r (using '0 7 * * *')", expr)
+        trigger = CronExpressionTrigger.from_cron("0 7 * * *")
     tz = _local_tz()
     kwargs = {"timezone": tz} if tz is not None else {}
     scheduler = AsyncIOScheduler(**kwargs)
     scheduler.add_job(
         job,
-        trigger="cron",
-        minute=minute,
-        hour=hour,
+        trigger=trigger,
         id="morning_run",
         replace_existing=True,
-        misfire_grace_time=3600,  # пропуск, если машина спала в момент запуска
+        misfire_grace_time=3600,  # skip if machine is sleeping at run time
     )
     scheduler.start()
-    log.info("планировщик запущен: ежедневный прогон в %02d:%02d", hour, minute)
+    log.info("planned run started: cron '%s'", expr)
     return scheduler
